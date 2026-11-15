@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DIVE — 見た目の試作</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; color: #e8e6e0;
+    font-family: "SFMono-Regular", Consolas, "Noto Sans Mono CJK JP", "MS Gothic", monospace; }
+  canvas { display: block; }
+  #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+  .panel { position: fixed; background: rgba(8, 9, 12, .72); border: 1px solid rgba(255,255,255,.14);
+    backdrop-filter: blur(6px); }
+  #mission { top: 16px; left: 16px; width: 380px; padding: 12px 14px; font-size: 13px; line-height: 1.7; }
+  #mission h1 { font-size: 12px; letter-spacing: .2em; margin: 0 0 6px; opacity: .6; font-weight: normal; }
+  #mission .req { margin-bottom: 8px; }
+  #mission li { list-style: none; opacity: .55; }
+  #mission ul { margin: 0; padding: 0; }
+  #mission li.now { opacity: 1; }
+  #mission li.done { opacity: .4; text-decoration: line-through; }
+  #mission code { color: #ffd28a; }
+  #depth { top: 16px; right: 16px; padding: 12px 16px; text-align: right; min-width: 200px; }
+  #depth .n { font-size: 44px; letter-spacing: .08em; line-height: 1; }
+  #depth .cap { font-size: 11px; letter-spacing: .3em; opacity: .6; }
+  #depth pre { margin: 10px 0 0; font: inherit; font-size: 12px; text-align: left; line-height: 1.6; opacity: .85; }
+  #term { left: 16px; bottom: 16px; width: 560px; max-width: calc(100vw - 32px); font-size: 13px; }
+  #log { height: 190px; overflow-y: auto; padding: 10px 12px 0; white-space: pre-wrap; line-height: 1.5; }
+  #log .in { color: #9fd3ff; } #log .err { color: #ff8f8f; } #log .ok { color: #b6f5b0; } #log .dim { opacity: .55; }
+  #row { display: flex; padding: 6px 12px 10px; gap: 8px; }
+  #ps1 { color: #9fd3ff; white-space: nowrap; }
+  #cmd { flex: 1; background: transparent; border: 0; outline: 0; color: inherit; font: inherit; }
+  #sound { position: fixed; right: 16px; bottom: 16px; padding: 6px 10px; font: inherit; font-size: 12px;
+    color: inherit; cursor: pointer; }
+  #note { position: fixed; right: 16px; bottom: 56px; font-size: 11px; opacity: .45; text-align: right; }
+</style>
+</head>
+<body>
+<div id="flash"></div>
+
+<div id="mission" class="panel">
+  <h1>依頼</h1>
+  <div class="req">「夜になると注文サイトが固まる。奥で何かが暴れている。止めてくれ」</div>
+  <ul id="steps"></ul>
+</div>
+
+<div id="depth" class="panel">
+  <div class="cap">LAYER</div>
+  <div class="n" id="depthN">01</div>
+  <pre id="chain"></pre>
+</div>
+
+<div id="term" class="panel">
+  <div id="log"></div>
+  <div id="row"><span id="ps1"></span><input id="cmd" autocomplete="off" spellcheck="false" autofocus></div>
+</div>
+
+<button id="sound" class="panel">音: OFF</button>
+<div id="note">見た目の試作。中のシステムは作り物です</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const V3 = THREE.Vector3;
+const S = 120; // 街1枚の一辺
+
+// ---------- 作り物のシステム ----------
+const NET = {
+  'edge-gw': { kind: 'host', dirs: ['etc', 'var', 'srv', 'home', 'opt', 'usr', 'tmp', 'proc'],
+    procs: [{ pid: 1, cpu: 0.0, name: 'init' }, { pid: 212, cpu: 0.1, name: 'sshd' }, { pid: 340, cpu: 2.4, name: 'nginx' }],
+    children: ['core-db', 'cache'] },
+  'cache': { kind: 'host', dirs: ['etc', 'var', 'data', 'tmp'],
+    procs: [{ pid: 1, cpu: 0.0, name: 'init' }, { pid: 88, cpu: 1.2, name: 'redis-server' }], children: [] },
+  'core-db': { kind: 'host', dirs: ['etc', 'var', 'lib', 'backup', 'mnt', 'run'],
+    procs: [{ pid: 1, cpu: 0.0, name: 'init' }, { pid: 190, cpu: 0.1, name: 'sshd' }, { pid: 411, cpu: 3.0, name: 'dockerd' }],
+    children: ['pg'] },
+  'pg': { kind: 'container', dirs: ['base', 'pg_wal', 'global', 'pg_stat'],
+    procs: [{ pid: 1, cpu: 1.1, name: 'postgres' }, { pid: 57, cpu: 0.4, name: 'checkpointer' },
+            { pid: 4242, cpu: 99.8, name: 'report_worker', rogue: true }],
+    children: [] },
+};
+for (const h of Object.values(NET)) h.seen = { hosts: false, procs: false, ls: false, docker: false };
+
+const PALS = [
+  { bg: 0xb9c0c4, fog: 0xb9c0c4, fogD: 0.0052, building: 0x6f757c, ground: 0x8a9096, edge: 0xfff1d0, glow: 0xffc46b, hemiTop: 0xffffff, hemiBot: 0x6b7178 },
+  { bg: 0x0e2a30, fog: 0x0e2a30, fogD: 0.0062, building: 0x1b454c, ground: 0x12353b, edge: 0x7ff0e0, glow: 0x66ffe6, hemiTop: 0x9fe8ff, hemiBot: 0x06181c },
+  { bg: 0x120407, fog: 0x120407, fogD: 0.0070, building: 0x2a1218, ground: 0x180609, edge: 0xff6a5a, glow: 0xff3b2e, hemiTop: 0xff9a8a, hemiBot: 0x050102 },
+];
+const CALM = { bg: 0x070b18, edge: 0x8fb4ff };
+
+const stack = ['edge-gw'];
+const here = () => stack[stack.length - 1];
+const depth = () => stack.length - 1;
+let killed = false, finished = false;
+
+// ---------- three.js ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0, 0.005);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 900);
+const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.6);
+const sun = new THREE.DirectionalLight(0xffffff, 1.2); sun.position.set(40, 80, 60);
+scene.add(hemi, sun, new THREE.AmbientLight(0xffffff, 0.35));
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.8, 0.6, 0.82);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight);
+});
+
+function rng(seed) { let a = seed >>> 0; return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const hash = s => [...s].reduce((h, c) => Math.imul(h ^ c.charCodeAt(0), 16777619), 2166136261) >>> 0;
+
+function label(text, color = '#ffffff', size = 1) {
+  const c = document.createElement('canvas'); c.width = 512; c.height = 96;
+  const x = c.getContext('2d'); x.font = '44px monospace'; x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.fillStyle = 'rgba(0,0,0,.55)'; const w = x.measureText(text).width + 36; x.fillRect(256 - w / 2, 14, w, 68);
+  x.fillStyle = color; x.fillText(text, 256, 50);
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthTest: false, fog: false }));
+  sp.scale.set(16 * size, 3 * size, 1); sp.renderOrder = 10; return sp;
+}
+
+// 街1枚。中央に通りを空ける
+function makeCity(seed, pal) {
+  const g = new THREE.Group(), r = rng(seed), N = 10, cell = S / N, boxes = [];
+  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+    const x = (i + .5) * cell - S / 2, z = (j + .5) * cell - S / 2;
+    if (Math.abs(x) < cell || r() < .1) continue;
+    boxes.push({ x, z, w: cell * (.45 + r() * .4), d: cell * (.45 + r() * .4), h: 5 + r() * r() * 52 });
+  }
+  const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1),
+    new THREE.MeshStandardMaterial({ color: pal.building, roughness: .92, metalness: .05 }), boxes.length);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), pos = [];
+  boxes.forEach((b, i) => {
+    m.compose(new V3(b.x, b.h / 2, b.z), q, new V3(b.w, b.h, b.d)); mesh.setMatrixAt(i, m);
+    const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2, h = b.h;
+    const P = [[x0, 0, z0], [x1, 0, z0], [x1, 0, z1], [x0, 0, z1], [x0, h, z0], [x1, h, z0], [x1, h, z1], [x0, h, z1]];
+    [[4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]].forEach(([a, c]) => pos.push(...P[a], ...P[c]));
+  });
+  const lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  const lines = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: pal.edge, transparent: true, opacity: .55 }));
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(S, S),
+    new THREE.MeshStandardMaterial({ color: pal.ground, roughness: 1, side: THREE.DoubleSide }));
+  ground.rotation.x = -Math.PI / 2;
+  g.add(mesh, lines, ground); g.userData = { boxes, lines };
+  return g;
+}
+
+// ---------- 階層の組み立て ----------
+let L = null; // 現在の階層の状態
+function enterLayer(fresh) {
+  if (L) scene.remove(L.world);
+  const id = here(), d = depth(), pal = PALS[d], host = NET[id], seed = hash(id);
+  const world = new THREE.Group(); scene.add(world);
+  L = { id, d, pal, world, folds: [], fold: fresh ? 0 : 1, t: 0, portals: {}, orbs: [], dirLabels: [], frags: [], rogue: null, edgeMats: [] };
+
+  const calm = d === 2 && killed;
+  scene.background = new THREE.Color(calm ? CALM.bg : pal.bg);
+  scene.fog.color.set(calm ? CALM.bg : pal.fog); scene.fog.density = pal.fogD;
+  hemi.color.set(pal.hemiTop); hemi.groundColor.set(pal.hemiBot);
+  sun.intensity = d === 0 ? 1.3 : .5;
+  bloom.strength = d === 0 ? 0.45 : 1.0;
+
+  if (d < 2) {
+    // 床の街 → 奥で立ち上がる街 → 頭上で逆さになる街
+    const base = makeCity(seed, pal); world.add(base); L.base = base; L.edgeMats.push(base.userData.lines.material);
+    const addFold = (parent, at, axis, sign, offset, s2) => {
+      const pivot = new THREE.Group(); pivot.position.copy(at); parent.add(pivot);
+      const city = makeCity(s2, pal); city.position.copy(offset); pivot.add(city);
+      L.folds.push({ pivot, axis, sign }); L.edgeMats.push(city.userData.lines.material);
+      return pivot;
+    };
+    const wall = addFold(world, new V3(0, 0, -S / 2), 'x', 1, new V3(0, 0, -S / 2), seed + 1);
+    addFold(wall, new V3(0, 0, -S), 'x', 1, new V3(0, 0, -S / 2), seed + 2);
+    if (d === 1) { // 2層目は左右も立ち上がり、街が筒になる
+      addFold(world, new V3(-S / 2, 0, 0), 'z', -1, new V3(-S / 2, 0, 0), seed + 3);
+      addFold(world, new V3(S / 2, 0, 0), 'z', 1, new V3(S / 2, 0, 0), seed + 4);
+    }
+    // 行き先(下の階層への入口)
+    host.children.forEach((name, k) => {
+      const g = new THREE.Group(); g.position.set(0, 0, 14 - k * 34);
+      const mat = new THREE.MeshBasicMaterial({ color: pal.glow, transparent: true, opacity: .9, fog: false });
+      const col = new THREE.Mesh(new THREE.CylinderGeometry(.35, .35, 120, 12), mat); col.position.y = 60;
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(5, .25, 8, 48), mat); ring.rotation.x = Math.PI / 2; ring.position.y = .3;
+      const well = new THREE.Mesh(new THREE.CircleGeometry(4.8, 48), new THREE.MeshBasicMaterial({ color: 0x000000 }));
+      well.rotation.x = -Math.PI / 2; well.position.y = .15;
+      const lb = label(name, '#ffffff', 1.1); lb.position.y = 12;
+      g.add(col, ring, well, lb); g.userData = { ring, kind: NET[name].kind };
+      g.visible = NET[name].kind === 'host' ? host.seen.hosts : host.seen.docker;
+      base.add(g); L.portals[name] = g;
+    });
+    // ディレクトリ名(ls で現れる)
+    const tall = [...base.userData.boxes].sort((a, b) => b.h - a.h).slice(0, host.dirs.length);
+    host.dirs.forEach((name, i) => {
+      const b = tall[i]; if (!b) return;
+      const lb = label('/' + name, '#fff1d0', .8); lb.position.set(b.x, b.h + 3, b.z); lb.visible = host.seen.ls;
+      base.add(lb); L.dirLabels.push(lb);
+    });
+  } else {
+    // 最下層: 街がほどけて漂う
+    const r = rng(seed);
+    const mat = new THREE.MeshStandardMaterial({ color: pal.building, roughness: .9 });
+    const lmat = new THREE.LineBasicMaterial({ color: calm ? CALM.edge : pal.edge, transparent: true, opacity: .7 });
+    L.edgeMats.push(lmat);
+    for (let i = 0; i < 110; i++) {
+      const geo = new THREE.BoxGeometry(3 + r() * 8, 6 + r() * r() * 46, 3 + r() * 8);
+      const f = new THREE.Mesh(geo, mat); f.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), lmat));
+      const dir = new V3(r() - .5, r() - .5, r() - .5).normalize().multiplyScalar(34 + r() * 120);
+      f.position.copy(dir).add(new V3(0, 20, -20)); f.rotation.set(r() * 6, r() * 6, r() * 6);
+      f.userData = { spin: new V3(r() - .5, r() - .5, r() - .5).multiplyScalar(.12), bob: r() * 6 };
+      world.add(f); L.frags.push(f);
+    }
+    host.dirs.forEach((name, i) => {
+      const lb = label('/' + name, '#ffd0c8', .8); lb.position.copy(L.frags[i * 7].position).add(new V3(0, 6, 0));
+      lb.visible = host.seen.ls; world.add(lb); L.dirLabels.push(lb);
+    });
+  }
+
+  // プロセス(ps で現れる)。暴走しているものだけは最初から遠くに見える
+  host.procs.forEach((p, i) => {
+    if (p.rogue) {
+      const g = new THREE.Group(); g.position.set(0, 20, -20);
+      const core = new THREE.Mesh(new THREE.IcosahedronGeometry(8, 1), new THREE.MeshBasicMaterial({ color: 0xff2a1e, wireframe: true, fog: false }));
+      const heart = new THREE.Mesh(new THREE.IcosahedronGeometry(4.5, 0), new THREE.MeshBasicMaterial({ color: 0xff5a3a, fog: false }));
+      const light = new THREE.PointLight(0xff3020, 900, 220);
+      const lb = label(`${p.pid} ${p.name}`, '#ff9a8a', 1.2); lb.position.y = 14; lb.visible = host.seen.procs;
+      g.add(core, heart, light, lb); world.add(g); L.rogue = { g, core, heart, light, lb, dying: 0 };
+      return;
+    }
+    const g = new THREE.Group();
+    const orb = new THREE.Mesh(new THREE.SphereGeometry(.9, 16, 12), new THREE.MeshBasicMaterial({ color: pal.glow, fog: false }));
+    const lb = label(`${p.pid} ${p.name}`, '#ffffff', .7); lb.position.y = 2.6;
+    g.add(orb, lb); g.visible = host.seen.procs; world.add(g);
+    L.orbs.push({ g, r: 13 + i * 4, y: 13 + i * 3, sp: .35 - i * .06, ph: i * 2.1 });
+  });
+
+  updateHud();
+  setTone(d);
+}
+
+const restPos = () => L.d === 2 ? new V3(0, 16, 62) : new V3(0, 7, S / 2 - 8);
+const restLook = () => L.d === 2 ? new V3(0, 20, -20) : new V3(0, 30, -S / 2);
+const look = new V3();
+
+// ---------- 演出(潜る / 浮上する) ----------
+let seq = null, busy = false;
+const ease = k => k * k * (3 - 2 * k), easeOut = k => 1 - Math.pow(1 - k, 3);
+const flash = document.getElementById('flash');
+function play(steps) { seq = { steps, i: 0, t: 0 }; busy = true; }
+
+function dive(target) {
+  const p = new V3(); L.portals[target].getWorldPosition(p);
+  const from = camera.position.clone(), over = p.clone().add(new V3(0, 9, 5)), lk0 = look.clone();
+  flash.style.background = '#000';
+  braam();
+  play([
+    { dur: 1.5, step: k => { camera.position.lerpVectors(from, over, ease(k)); look.lerpVectors(lk0, p, ease(k)); } },
+    { dur: 1.1, step: k => { const e = k * k; camera.position.set(p.x, over.y - e * 46, p.z + 5 * (1 - e)); look.set(p.x, -200, p.z);
+        camera.fov = 60 + 85 * e; flash.style.opacity = Math.max(0, k * 1.6 - .6); },
+      end: () => { stack.push(target); enterLayer(true); line(`── ${here()} に入った ──`, 'dim'); } },
+    { dur: 3.2, step: k => { const r = restPos(), e = easeOut(k); camera.position.set(r.x, r.y + (1 - e) * 130, r.z);
+        look.lerpVectors(new V3(r.x, 0, r.z - 2), restLook(), ease(Math.min(1, k * 1.3)));
+        camera.fov = 145 - 85 * e; flash.style.opacity = 1 - Math.min(1, k * 3); },
+      end: () => { busy = false; } },
+  ]);
+}
+
+function kick() {
+  const from = camera.position.clone();
+  flash.style.background = '#fff';
+  thud();
+  play([
+    { dur: .5, step: k => { camera.position.set(from.x, from.y + k * k * 160, from.z); camera.fov = 60 + 70 * k; flash.style.opacity = k; },
+      end: () => { stack.pop(); enterLayer(false); camera.position.copy(restPos()); look.copy(restLook());
+        line(`── ${here()} に戻った ──`, 'dim'); checkFinish(); } },
+    { dur: 1.4, step: k => { camera.fov = 130 - 70 * easeOut(k); flash.style.opacity = 1 - ease(k); }, end: () => { busy = false; } },
+  ]);
+}
+
+// ---------- 音 ----------
+let ac = null, master = null, oscs = [];
+const TONES = [98, 65.41, 43.65];
+function initAudio() {
+  ac = new (window.AudioContext || window.webkitAudioContext)();
+  master = ac.createGain(); master.gain.value = 0; master.connect(ac.destination);
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420; lp.connect(master);
+  [['sawtooth', 1], ['sawtooth', 1.006], ['sine', .5]].forEach(([type, mul]) => {
+    const o = ac.createOscillator(); o.type = type; o.frequency.value = TONES[depth()] * mul;
+    const g = ac.createGain(); g.gain.value = type === 'sine' ? .5 : .16; o.connect(g); g.connect(lp); o.start(); oscs.push({ o, mul });
+  });
+  master.gain.linearRampToValueAtTime(.5, ac.currentTime + 2);
+}
+function setTone(d) { if (!ac) return; oscs.forEach(({ o, mul }) => o.frequency.linearRampToValueAtTime(TONES[d] * mul, ac.currentTime + 3)); }
+function blast(type, f0, f1, dur, vol) {
+  if (!ac || ac.state !== 'running') return;
+  const o = ac.createOscillator(), g = ac.createGain(), lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 600;
+  o.type = type; o.frequency.setValueAtTime(f0, ac.currentTime); o.frequency.exponentialRampToValueAtTime(f1, ac.currentTime + dur);
+  g.gain.setValueAtTime(0, ac.currentTime); g.gain.linearRampToValueAtTime(vol, ac.currentTime + .08);
+  g.gain.exponentialRampToValueAtTime(.001, ac.currentTime + dur);
+  o.connect(lp); lp.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + dur + .05);
+}
+const braam = () => blast('sawtooth', 110, 30, 3.6, .5);
+const thud = () => blast('sine', 160, 38, .9, .7);
+const soundBtn = document.getElementById('sound');
+soundBtn.onclick = async () => {
+  if (!ac) initAudio();
+  if (ac.state === 'running' && soundBtn.dataset.on) { await ac.suspend(); delete soundBtn.dataset.on; soundBtn.textContent = '音: OFF'; }
+  else { await ac.resume(); soundBtn.dataset.on = 1; soundBtn.textContent = '音: ON'; }
+  cmdEl.focus();
+};
+
+// ---------- ターミナル ----------
+const logEl = document.getElementById('log'), cmdEl = document.getElementById('cmd'), ps1 = document.getElementById('ps1');
+function line(t, cls = '') { const d = document.createElement('div'); d.textContent = t; if (cls) d.className = cls; logEl.append(d); logEl.scrollTop = logEl.scrollHeight; }
+const prompt = () => `runner@${here()}:~${NET[here()].kind === 'container' ? '#' : '$'}`;
+
+function run(raw) {
+  const text = raw.trim(); line(`${prompt()} ${text}`, 'in'); if (!text) return;
+  const a = text.split(/\s+/), host = NET[here()];
+  const hosts = host.children.filter(c => NET[c].kind === 'host'), conts = host.children.filter(c => NET[c].kind === 'container');
+  switch (a[0]) {
+    case 'help': line('ls / ps / cat /etc/hosts / ssh <host> / docker ps / docker exec -it <名前> sh / kill <pid> / exit'); break;
+    case 'ls': line(host.dirs.join('  ')); host.seen.ls = true; L.dirLabels.forEach(l => l.visible = true); break;
+    case 'ps': {
+      line('  PID  %CPU  COMMAND');
+      host.procs.forEach(p => line(`${String(p.pid).padStart(5)} ${p.cpu.toFixed(1).padStart(5)}  ${p.name}`, p.rogue ? 'err' : ''));
+      host.seen.procs = true; L.orbs.forEach(o => o.g.visible = true); if (L.rogue) L.rogue.lb.visible = true; break;
+    }
+    case 'cat':
+      if (a[1] !== '/etc/hosts') { line(`cat: ${a[1] || ''}: この試作では読めません`, 'err'); break; }
+      line('127.0.0.1   localhost'); hosts.forEach((h, i) => line(`10.0.${depth() + 1}.${i + 11}   ${h}`));
+      host.seen.hosts = true; hosts.forEach(h => L.portals[h].visible = true); break;
+    case 'ssh': {
+      const t = (a[1] || '').split('@').pop();
+      if (hosts.includes(t)) { if (!host.seen.hosts) { host.seen.hosts = true; hosts.forEach(h => L.portals[h].visible = true); } dive(t); }
+      else if (conts.includes(t)) line(`ssh: connect to host ${t} port 22: Connection refused`, 'err');
+      else line(`ssh: Could not resolve hostname ${t || ''}: Name or service not known`, 'err');
+      break;
+    }
+    case 'docker':
+      if (host.kind === 'container' || !host.procs.some(p => p.name === 'dockerd')) { line('docker: command not found', 'err'); break; }
+      if (a[1] === 'ps') {
+        line('CONTAINER ID   IMAGE         STATUS       NAMES');
+        conts.forEach(c => line(`3f9a1c0b77e2   postgres:16   Up 41 days   ${c}`));
+        host.seen.docker = true; conts.forEach(c => L.portals[c].visible = true);
+      } else if (a[1] === 'exec') {
+        const t = a.slice(2).find(x => conts.includes(x));
+        if (t) { host.seen.docker = true; L.portals[t].visible = true; dive(t); } else line('Error: No such container', 'err');
+      } else line('この試作で使えるのは docker ps と docker exec だけです', 'dim');
+      break;
+    case 'kill': {
+      const pid = Number(a[a.length - 1]), p = host.procs.find(x => x.pid === pid);
+      if (!p) { line(`kill: (${a[a.length - 1] || ''}) - No such process`, 'err'); break; }
+      if (!p.rogue) { line(`kill: (${pid}) - Operation not permitted`, 'err'); break; }
+      host.procs = host.procs.filter(x => x !== p); killed = true; L.rogue.dying = 0.0001; thud();
+      line(`プロセス ${pid} (${p.name}) が止まった。`, 'ok'); break;
+    }
+    case 'exit': case 'logout':
+      if (depth() === 0) line('これ以上は浮上できません。ここが一番上の層です。', 'dim'); else kick(); break;
+    default: line(`${a[0]}: command not found`, 'err');
+  }
+  updateHud();
+}
+cmdEl.addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || busy) return;
+  const v = cmdEl.value; cmdEl.value = ''; run(v);
+});
+addEventListener('pointerdown', e => { if (e.target.tagName !== 'BUTTON') setTimeout(() => cmdEl.focus(), 0); });
+
+// ---------- 画面の文字 ----------
+const STEPS = [
+  { t: 'つながっている機械を調べる', c: 'cat /etc/hosts', done: () => NET['edge-gw'].seen.hosts },
+  { t: '奥の機械へ潜る', c: 'ssh core-db', done: () => stack.includes('core-db') || killed },
+  { t: 'さらに中のコンテナへ潜る', c: 'docker ps → docker exec -it pg sh', done: () => stack.includes('pg') || killed },
+  { t: '暴れているものを見つけて止める', c: 'ps → kill 4242', done: () => killed },
+  { t: '浮上する', c: 'exit を2回', done: () => finished },
+];
+function updateHud() {
+  ps1.textContent = prompt();
+  document.getElementById('depthN').textContent = String(depth() + 1).padStart(2, '0');
+  document.getElementById('chain').textContent = stack.map((s, i) => ' '.repeat(i * 2) + (i ? '└ ' : '') + s + (i === depth() ? '  ◀' : '')).join('\n');
+  const ul = document.getElementById('steps'); ul.innerHTML = '';
+  const cur = STEPS.findIndex(s => !s.done());
+  STEPS.forEach((s, i) => {
+    const li = document.createElement('li'); li.className = i < cur || cur === -1 ? 'done' : i === cur ? 'now' : '';
+    li.innerHTML = `${i < cur || cur === -1 ? '✓' : i === cur ? '▸' : '·'} ${s.t} <code>${i === cur ? s.c : ''}</code>`; ul.append(li);
+  });
+}
+function checkFinish() {
+  if (killed && depth() === 0 && !finished) { finished = true; line('依頼完了。注文サイトは静かになった。  報酬 +¥120,000', 'ok'); updateHud(); }
+}
+
+// ---------- ループ ----------
+const mouse = { x: 0, y: 0 };
+addEventListener('pointermove', e => { mouse.x = e.clientX / innerWidth - .5; mouse.y = e.clientY / innerHeight - .5; });
+const clock = new THREE.Clock(); let T = 0;
+const tmpC = new THREE.Color();
+function frame() {
+  const dt = Math.min(clock.getDelta(), .05), slow = [1, .7, .45][L.d]; T += dt * slow; L.t += dt;
+
+  // 街が折れ上がる
+  if (L.folds.length) {
+    L.fold = Math.min(1, L.fold + dt / 6);
+    const th = ease(L.fold) * Math.PI / 2;
+    L.folds.forEach(f => { f.pivot.rotation[f.axis] = th * f.sign; });
+    if (L.d === 1) L.world.rotation.z = Math.sin(T * .22) * .3 * ease(L.fold); // 重力が傾く
+  }
+  L.frags.forEach(f => { f.rotation.x += f.userData.spin.x * dt; f.rotation.y += f.userData.spin.y * dt; f.position.y += Math.sin(T * .5 + f.userData.bob) * dt * .8; });
+  L.orbs.forEach(o => { const a = T * o.sp + o.ph; o.g.position.set(Math.cos(a) * o.r, o.y + Math.sin(a * 1.7), 14 + Math.sin(a) * o.r); });
+  Object.values(L.portals).forEach(p => { p.userData.ring.scale.setScalar(1 + Math.sin(T * 2.2) * .08); });
+
+  if (L.rogue) {
+    const R = L.rogue;
+    if (R.dying) {
+      R.dying = Math.min(1, R.dying + dt / 2.2); const k = 1 - ease(R.dying);
+      R.g.scale.setScalar(Math.max(.001, k)); R.light.intensity = 900 * k;
+      scene.background.lerp(tmpC.set(CALM.bg), dt * 1.2); scene.fog.color.copy(scene.background);
+      L.edgeMats.forEach(m => m.color.lerp(tmpC.set(CALM.edge), dt * 1.2));
+      if (R.dying >= 1) { L.world.remove(R.g); L.rogue = null; }
+    } else {
+      const pulse = 1 + Math.sin(T * 9) * .12 + Math.sin(T * 23) * .05;
+      R.core.scale.setScalar(pulse); R.core.rotation.x += dt * .9; R.core.rotation.y += dt * 1.3; R.heart.rotation.y -= dt * 2;
+      R.light.intensity = 700 + Math.sin(T * 9) * 400;
+    }
+  }
+
+  if (seq) {
+    const s = seq.steps[seq.i]; seq.t += dt; const k = Math.min(1, seq.t / s.dur); s.step(k);
+    if (k >= 1) { s.end && s.end(); seq.i++; seq.t = 0; if (seq.i >= seq.steps.length) seq = null; }
+  } else {
+    const r = restPos();
+    camera.position.lerp(new V3(r.x + Math.sin(T * .2) * 3 + mouse.x * 6, r.y + Math.sin(T * .13) * 1.2 - mouse.y * 3, r.z), .04);
+    look.lerp(restLook(), .05); camera.fov += (60 - camera.fov) * .08;
+  }
+  camera.lookAt(look); camera.updateProjectionMatrix();
+  composer.render();
+  requestAnimationFrame(frame);
+}
+
+enterLayer(true);
+camera.position.copy(restPos()); look.copy(restLook());
+line('接続しました。help で使える命令を表示します。', 'dim');
+window.__dive = { run, state: () => ({ stack: [...stack], killed, finished, busy }) };
+frame();
+</script>
+</body>
+</html>
