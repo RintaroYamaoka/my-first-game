@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>見た目の試作 2 — 3Dの画面 + エディタ + ターミナル</title>
+<style>
+  :root { --mono: Consolas, "SFMono-Regular", "Noto Sans Mono CJK JP", "MS Gothic", monospace;
+          --mincho: "Yu Mincho", "Hiragino Mincho ProN", "Noto Serif CJK JP", serif; }
+  html, body { margin: 0; height: 100%; background: #d9d9d5; overflow: hidden; color: #141414; font-family: var(--mono); }
+  canvas { display: block; }
+  #crumb { position: fixed; left: 16px; top: 14px; font-size: 13px; color: #141414; }
+  #mode { position: fixed; right: 16px; top: 14px; font-size: 13px; color: #141414; }
+  #term { position: fixed; left: 16px; bottom: 16px; width: 600px; max-width: calc(100vw - 32px); background: rgba(0, 0, 0, .86); color: #e6e6e6; }
+  #log { height: 132px; overflow-y: auto; padding: 10px 12px; font-size: 12.5px; line-height: 18px; white-space: pre-wrap; }
+  #log .in { color: #9fd3ff; } #log .err { color: #ff6b62; } #log .ok { color: #9be19b; } #log .dim { color: #7a7a7a; }
+  #keys { position: fixed; right: 16px; bottom: 16px; font-size: 12px; color: #141414; background: rgba(255,255,255,.7); padding: 6px 10px; }
+  #card { position: fixed; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center;
+          text-align: center; padding: 0 6vw; z-index: 9; font-family: var(--mono); }
+  #cardMain { font-size: 5vw; line-height: 1.2; letter-spacing: .02em; word-break: break-all; }
+  #cardSub { font-size: 1.5vw; margin-top: 2vw; letter-spacing: .35em; opacity: .85; font-family: var(--mono); }
+  #card.small #cardMain { font-size: 2.6vw; }
+  kbd { font-family: inherit; font-weight: bold; }
+</style>
+</head>
+<body>
+<div id="crumb"></div><div id="mode"></div>
+<div id="term"><div id="log"></div></div>
+<div id="keys"><kbd>Enter</kbd> ファイルに潜る / 戻る　<kbd>E</kbd> 障害を起こす / 直す　<kbd>G</kbd> コミットの連続</div>
+<div id="card"><div id="cardMain"></div><div id="cardSub"></div></div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+const V3 = THREE.Vector3, MONO = 'Consolas,"SFMono-Regular","Noto Sans Mono CJK JP",monospace';
+const C = { bg: 0xd9d9d5, own: 0xffffff, dep: 0x8c8c8c, slab: 0xf0f0ee, ground: 0xe6e6e2, line: 0x111111, rail: 0x111111,
+            select: 0xffa033, err: 0xe2231a, text: '#141414', dim: '#5f5f5f' };
+
+// ---------- three.js ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene(); scene.background = new THREE.Color(C.bg); scene.fog = new THREE.Fog(C.bg, 320, 760);
+const camera = new THREE.PerspectiveCamera(50, 1, .1, 1500);
+const sun = new THREE.DirectionalLight(0xffffff, 2.4); sun.position.set(60, 100, 45);
+scene.add(sun, new THREE.AmbientLight(0xffffff, .9));
+function resize() { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+addEventListener('resize', resize);
+
+// 面を数段の明るさで塗る(3D ソフトの表示のような平らな陰影)
+const grad = new THREE.DataTexture(new Uint8Array([120, 120, 120, 255, 185, 185, 185, 255, 255, 255, 255, 255]), 3, 1, THREE.RGBAFormat);
+grad.minFilter = grad.magFilter = THREE.NearestFilter; grad.needsUpdate = true;
+const toon = color => new THREE.MeshToonMaterial({ color, gradientMap: grad });
+const mat = { own: toon(C.own), dep: toon(C.dep), slab: toon(C.slab), node: toon(C.own), acc: toon(C.own) };
+const lineMat = (color, opacity = 1) => new THREE.LineBasicMaterial({ color, transparent: opacity < 1, opacity });
+const unit = new THREE.BoxGeometry(1, 1, 1), unitEdges = new THREE.EdgesGeometry(unit);
+
+function label(text, size = 1.3, color = C.text, align = 'center') {
+  const c = document.createElement('canvas'), x = c.getContext('2d'), px = 64;
+  x.font = `${px}px ${MONO}`; c.width = Math.ceil(x.measureText(text).width) + 16; c.height = px * 1.4;
+  x.font = `${px}px ${MONO}`; x.textBaseline = 'middle'; 
+  x.fillStyle = color; x.fillText(text, 8, c.height / 2);
+  const tex = new THREE.CanvasTexture(c); tex.anisotropy = 4;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, fog: false }));
+  const h = size * 1.4; sp.scale.set(h * c.width / c.height, h, 1); if (align === 'left') sp.center.set(0, .5); return sp;
+}
+function ground(size, y = 0) {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(size, size), new THREE.MeshBasicMaterial({ color: C.ground })); m.rotation.x = -Math.PI / 2; m.position.y = y; return m;
+}
+
+// ---------- フォルダの世界 ----------
+const dirWorld = new THREE.Group(); scene.add(dirWorld);
+const items = [];
+const addLabel = (g, text, x, y, z, size, color, align) => { const s = label(text, size, color, align); s.position.set(x, y, z); g.add(s); };
+function platform(name, x, z, w, d, y0 = 0) { items.push({ x, z, w, d, h: 1, y0, kind: 'slab' }); addLabel(dirWorld, name + '/', x - w / 2 + 1, y0 + 2.4, z + d / 2 + .6, 2, C.text, 'left'); }
+function file(name, lines, x, z, y0 = 1) { const h = Math.min(92, 2 + lines * .42), it = { x, z, w: 4.6, d: 4.6, h, y0, kind: 'own', name }; items.push(it); addLabel(dirWorld, name, x, y0 + h + 1.5, z, 1.2); return it; }
+platform('src', -36, -12, 46, 52);
+const serverTs = file('server.ts', 48, -24, 6); file('fragment.ts', 30, -36, 6);
+const storeTs = file('store.ts', 62, -48, 6);
+platform('routes', -26, -22, 20, 16, 1); file('create.ts', 41, -31, -22, 2); file('get.ts', 27, -22, -22, 2);
+platform('db', -47, -22, 18, 16, 1); file('client.ts', 22, -51, -22, 2); file('queries.ts', 55, -43, -22, 2);
+platform('tests', 34, 4, 30, 22); file('fragment.test.ts', 36, 26, 4); file('api.test.ts', 71, 39, 4);
+platform('scripts', 34, -34, 30, 20); file('deploy.sh', 18, 27, -34); file('backup.sh', 12, 39, -34);
+file('package.json', 31, -12, -66, 0); file('package-lock.json', 4200, -4, -66, 0); file('tsconfig.json', 14, 4, -66, 0);
+file('README.md', 58, 12, -66, 0); file('.gitignore', 6, 20, -66, 0);
+addLabel(dirWorld, 'node_modules/', 0, 14, -92, 5, C.dim);
+{ let a = 12345; const r = () => { a = (a * 1664525 + 1013904223) >>> 0; return a / 4294967296; };
+  for (let i = 0; i < 20; i++) for (let j = 0; j < 14; j++) { const q = r(); items.push({ x: (i - 9.5) * 11, z: -104 - j * 11, w: 5 + r() * 4, d: 5 + r() * 4, h: 4 + q * q * 78, y0: 0, kind: 'dep' }); } }
+serverTs.kind = 'sel'; storeTs.kind = 'acc';
+
+function boxesGroup(list) {
+  const g = new THREE.Group(), m = new THREE.Matrix4(), q = new THREE.Quaternion();
+  for (const kind of ['own', 'dep', 'slab']) {
+    const l = list.filter(i => i.kind === kind); if (!l.length) continue;
+    const mesh = new THREE.InstancedMesh(unit, mat[kind], l.length);
+    l.forEach((b, i) => { m.compose(new V3(b.x, b.y0 + b.h / 2, b.z), q, new V3(b.w, b.h, b.d)); mesh.setMatrixAt(i, m); }); g.add(mesh);
+  }
+  const pos = [];
+  for (const b of list.filter(i => i.kind !== 'sel' && i.kind !== 'acc')) {
+    const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2, y0 = b.y0, y1 = b.y0 + b.h;
+    const P = [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1], [x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1]];
+    [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]].forEach(([a, c]) => pos.push(...P[a], ...P[c]));
+  }
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.add(new THREE.LineSegments(geo, lineMat(C.line)));
+  return g;
+}
+function single(b, material, edgeColor) {
+  const g = new THREE.Group(), me = new THREE.Mesh(unit, material), ed = new THREE.LineSegments(unitEdges, lineMat(edgeColor));
+  g.add(me, ed); g.position.set(b.x, b.y0 + b.h / 2, b.z); g.scale.set(b.w, b.h, b.d); g.userData.edges = ed; return g;
+}
+dirWorld.add(boxesGroup(items), ground(900));
+dirWorld.add(single(serverTs, mat.own, C.select));       // 選んでいるファイルは橙の輪郭
+const storeObj = single(storeTs, mat.acc, C.line); dirWorld.add(storeObj);
+const sky = boxesGroup(items); sky.rotation.z = Math.PI; sky.position.y = 200; dirWorld.add(sky);   // 頭上で逆さになる街
+
+// ---------- コードの世界: 柱の中に入る。関数は階、{ } は囲われた区画 ----------
+const codeWorld = new THREE.Group(); codeWorld.visible = false; scene.add(codeWorld);
+function box(x0, x1, y0, y1, z0, z1, material = mat.own, edges = true) {
+  const b = { x: (x0 + x1) / 2, y0, z: (z0 + z1) / 2, w: Math.abs(x1 - x0), h: y1 - y0, d: Math.abs(z1 - z0) };
+  if (edges) { const g = single(b, material, C.line); codeWorld.add(g); return g; }
+  const m = new THREE.Mesh(unit, material); m.position.set(b.x, y0 + b.h / 2, b.z); m.scale.set(b.w, b.h, b.d); codeWorld.add(m); return m;
+}
+const HX = 48, ZF = 34, ZB = -170, TOP = 150;
+// 床(readBody へ降りる穴と、障害のときに抜ける床を分けて作る)
+box(-HX, HX, -1, 0, ZF, -28, mat.slab, false);
+box(-HX, -28, -1, 0, -28, -36, mat.slab, false); box(-20, HX, -1, 0, -28, -36, mat.slab, false);
+box(-HX, HX, -1, 0, -36, -62, mat.slab, false);
+box(-HX, 12, -1, 0, -62, -72, mat.slab, false); box(30, HX, -1, 0, -62, -72, mat.slab, false);
+const gapTile = box(12, 30, -1, 0, -62, -72, mat.slab, false);
+box(-HX, HX, -1, 0, -72, ZB, mat.slab, false);
+// 柱の内壁。高さの目安になる横線
+box(-HX - 2, -HX, -1, TOP, ZF, ZB); box(HX, HX + 2, -1, TOP, ZF, ZB); box(-HX, HX, -1, TOP, ZB - 2, ZB);
+{ const pts = []; for (let y = 20; y < TOP; y += 20) { const A = [[-HX, ZF], [-HX, ZB], [HX, ZB], [HX, ZF]];
+    for (let i = 0; i < 3; i++) pts.push(new V3(A[i][0] * .999, y, A[i][1] * .999 + (i === 1 ? .2 : 0)), new V3(A[i + 1][0] * .999, y, A[i + 1][1] * .999 + (i === 1 ? .2 : 0))); }
+  codeWorld.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts), lineMat(C.line, .35))); }
+addLabel(codeWorld, 'createServer(async (req, res) => { … })', -44, 1.4, 30, 1.5, C.text, 'left');
+
+// { } を囲いにする。入口の上に条件を書く
+function enclosure(x0, x1, zf, zb, h, gx, text) {
+  const t = .6, gw = 4;
+  box(x0, x0 + t, 0, h, zf, zb); box(x1 - t, x1, 0, h, zf, zb); box(x0, x1, 0, h, zb, zb + t);
+  box(x0, gx - gw, 0, h, zf - t, zf); box(gx + gw, x1, 0, h, zf - t, zf); box(gx - gw, gx + gw, h, h + 1.4, zf - t, zf);
+  addLabel(codeWorld, text, gx, h + 3.2, zf + .4, 1.5);
+}
+function pedestal(name, x, z) { box(x - 1.2, x + 1.2, 0, 1.4, z - 1.2, z + 1.2, mat.slab); box(x - .8, x + .8, 1.4, 3, z - .8, z + .8); addLabel(codeWorld, name, x, 4.6, z, 1.1); }
+function shaft(x, z, text) {   // return: 上へ抜ける
+  const pts = []; for (const [dx, dz] of [[-2, -2], [2, -2], [2, 2], [-2, 2]]) pts.push(new V3(x + dx, 0, z + dz), new V3(x + dx, TOP, z + dz));
+  codeWorld.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts), lineMat(C.line)));
+  box(x - 2.4, x + 2.4, 0, .3, z - 2.4, z + 2.4, mat.own); addLabel(codeWorld, text, x, 7.4, z, 1.3);
+}
+function portal(x, z, side, text) {  // 他のファイルへ通じる口
+  const m = new THREE.MeshBasicMaterial({ color: 0x0a0a0a, side: THREE.DoubleSide }), pl = new THREE.Mesh(new THREE.PlaneGeometry(8, 6.4), m);
+  pl.rotation.y = -side * Math.PI / 2; pl.position.set(x, 3.2, z); codeWorld.add(pl); addLabel(codeWorld, text, x - side * .4, 8, z, 1.2); return m;
+}
+pedestal('url', 6, -4);
+// if (POST /fragments) { … }
+enclosure(-36, -6, -20, -80, 7, -21, 'if (POST /fragments)');
+pedestal('body', -28, -24); pedestal('fragment', -12, -40); pedestal('saved', -12, -66);
+portal(-35.3, -40, -1, 'import "./fragment"'); portal(-35.3, -66, -1, 'import "./store"');
+enclosure(-32, -15, -46, -60, 5, -23.5, 'if (!fragment.ok)'); shaft(-23.5, -54, 'return 400');
+shaft(-21, -73, 'return 201');
+addLabel(codeWorld, 'readBody()', -24, 2.2, -27, 1.1);
+// 下の階: readBody(req)。呼び出しは、床の穴から下へ降りる
+box(-46, -2, -41, -40, -14, -54, mat.slab); addLabel(codeWorld, 'readBody(req)', -24, -37.5, -30, 2.4);
+{ const ring = new THREE.Mesh(new THREE.TorusGeometry(5, .16, 6, 48), new THREE.MeshBasicMaterial({ color: C.line })); ring.rotation.x = Math.PI / 2; ring.position.set(-24, -39.6, -32); codeWorld.add(ring); }
+// if (GET /fragments/) { … }
+enclosure(6, 36, -20, -80, 7, 21, 'if (GET /fragments/:id)');
+pedestal('id', 28, -32);
+const storePortal = portal(35.3, -44, 1, 'await store.findById(id)');
+addLabel(codeWorld, 'import "./store"', 34.9, 10.4, -44, 1, C.dim);
+const rowsOk = new THREE.Group(), rowsBad = new THREE.Group(); codeWorld.add(rowsOk, rowsBad);
+{ for (let i = 0; i < 3; i++) { const g = single({ x: 25 + i * 3.4, y0: 0, z: -58, w: 2.8, h: 2.2, d: 2.8 }, mat.own, C.line); rowsOk.add(g); const l = label(`[${i}]`, .9); l.position.set(25 + i * 3.4, 3.4, -58); rowsOk.add(l); }
+  const l1 = label('rows', 1.2); l1.position.set(28.4, 5.4, -58); rowsOk.add(l1);
+  const l2 = label('rows = [ ]', 1.2, '#e2231a'); l2.position.set(28.4, 3, -58); rowsBad.add(l2); }
+shaft(21, -73, 'return 200');
+shaft(0, -110, 'return 404');
+
+// 実行の流れに乗って進む(中に立った高さ)
+const EYE = 3.4;
+const WP = [   // [位置, 見る先, 対応する行, 立ち止まる秒数]
+  [new V3(0, EYE, 28), new V3(0, 30, -120), 7, 1.0],
+  [new V3(0, EYE, 4), new V3(5, 3, -5), 8, .6],
+  [new V3(0, EYE, -11), new V3(21, 6, -22), 20, .5],
+  [new V3(21, EYE, -17), new V3(21, 5, -60), 20, .2],
+  [new V3(21, EYE, -29), new V3(28, 3, -33), 21, .6],
+  [new V3(21, EYE, -44), new V3(35, 4, -44), 22, 1.5],
+  [new V3(21, EYE, -52), new V3(28, 2.5, -58), 23, 1.0],
+  [new V3(21, EYE, -71), new V3(21, 60, -76), 23, .2],
+  [new V3(21, 90, -72), new V3(21, 160, -74), 23, 0],
+];
+let ri = 0, rk = 0, rpause = 0, fall = 0; const rpos = new V3(), rlook = new V3();
+function resetRide() { ri = 0; rk = 0; rpause = WP[0][3]; fall = 0; rpos.copy(WP[0][0]); rlook.copy(WP[0][1]); look.copy(rlook); if (curLine !== WP[0][2]) { curLine = WP[0][2]; renderEditor(); } }
+function ride(dt) {
+  storePortal.color.set(rpause > 0 && ri === 5 ? C.select : 0x0a0a0a);
+  if (fall) { fall += dt; rpos.y -= dt * 34 * fall; rlook.set(rpos.x, rpos.y - 30, rpos.z - 8); if (fall > 1.8) resetRide(); return; }
+  if (rpause > 0) { rpause -= dt; return; }
+  const a = WP[ri][0], b = WP[ri + 1][0]; rk += dt * (ri === 7 ? 34 : 13) / a.distanceTo(b);
+  const e = Math.min(1, rk); rpos.lerpVectors(a, b, e); rlook.lerpVectors(WP[ri][1], WP[ri + 1][1], e);
+  if (err && ri === 6 && rpos.z < -62.5) { fall = .0001; return; }
+  if (rk >= 1) { ri++; rk = 0; rpause = WP[ri][3]; if (WP[ri][2] !== curLine) { curLine = WP[ri][2]; renderEditor(); } if (ri >= WP.length - 1) resetRide(); }
+}
+
+// ---------- エディタとターミナル ----------
+const SRC = `import { createServer } from "node:http";
+import { parseFragment } from "./fragment";
+import { store } from "./store";
+
+const PORT = 8080;
+
+export const server = createServer(async (req, res) => {
+  const url = new URL(req.url ?? "/", "http://localhost");
+
+  if (req.method === "POST" && url.pathname === "/fragments") {
+    const body = await readBody(req);
+    const fragment = parseFragment(body);
+    if (!fragment.ok) {
+      return send(res, 400, { error: fragment.reason });
+    }
+    const saved = await store.save(fragment.value);
+    return send(res, 201, saved);
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/fragments/")) {
+    const id = Number(url.pathname.split("/")[2]);
+    const rows = await store.findById(id);
+    return send(res, 200, rows[0].payload);
+  }
+
+  return send(res, 404, { error: "not found" });
+});
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function send(res, status, body) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+server.listen(PORT);`.split('\n');
+const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const hl = s => { let out = '', last = 0; const re = /("[^"]*")|\b(import|from|const|export|async|await|if|return|function|for|of|new)\b|\b(\d+)\b/g; let m;
+  while ((m = re.exec(s))) { out += esc(s.slice(last, m.index)) + `<span class="${m[1] ? 'st' : m[2] ? 'kw' : 'nu'}">${esc(m[0])}</span>`; last = re.lastIndex; }
+  return out + esc(s.slice(last)); };
+const pc = document.createElement('canvas'); pc.width = 1280; pc.height = 1100; const pctx = pc.getContext('2d');
+const ptex = new THREE.CanvasTexture(pc); ptex.anisotropy = 8;
+const edGroup = new THREE.Group(); edGroup.position.set(0, 66, -168.4); edGroup.scale.setScalar(1.28); codeWorld.add(edGroup);
+const panel = new THREE.Mesh(new THREE.PlaneGeometry(66, 56.7), new THREE.MeshBasicMaterial({ map: ptex, fog: false })); edGroup.add(panel);
+{ const back = new THREE.Mesh(new THREE.BoxGeometry(67, 57.7, 1.2), new THREE.MeshBasicMaterial({ color: 0x0a0a0a })); back.position.z = -.7; edGroup.add(back); }
+const TOK = /("[^"]*")|\b(import|from|const|export|async|await|if|return|function|for|of|new)\b|\b(\d+)\b/g;
+let curLine = -1;
+function renderEditor() {   // 今いる行の前後だけを、大きく映す
+  const W = 1280, H = 1100, lh = 58, rows = 17;
+  pctx.fillStyle = '#0a0a0a'; pctx.fillRect(0, 0, W, H);
+  pctx.font = `28px ${MONO}`; pctx.textBaseline = 'middle';
+  pctx.fillStyle = '#8a8a8a'; pctx.fillText('src/server.ts', 28, 36);
+  const cw = pctx.measureText('M').width, first = Math.max(0, Math.min(SRC.length - rows, curLine - 9)), x0 = 104;
+  for (let r = 0; r < rows; r++) {
+    const i = first + r, y = 100 + r * lh; if (i >= SRC.length) break;
+    if (err && i + 1 === 23) { pctx.fillStyle = 'rgba(226,35,26,.34)'; pctx.fillRect(0, y - lh / 2, W, lh); pctx.fillStyle = '#e2231a'; pctx.fillRect(0, y - lh / 2, 10, lh); }
+    if (i + 1 === curLine) { pctx.fillStyle = 'rgba(255,160,51,.24)'; pctx.fillRect(0, y - lh / 2, W, lh); pctx.fillStyle = '#ffa033'; pctx.fillRect(0, y - lh / 2, 10, lh); }
+    pctx.fillStyle = '#5c5c5c'; pctx.fillText(String(i + 1).padStart(2), 28, y);
+    const line = SRC[i]; let last = 0, m; TOK.lastIndex = 0;
+    const seg = (t, col, c0) => { if (t) { pctx.fillStyle = col; pctx.fillText(t, x0 + c0 * cw, y); } };
+    while ((m = TOK.exec(line))) { seg(line.slice(last, m.index), '#e6e6e6', last); seg(m[0], m[1] ? '#a5d6a7' : m[2] ? '#c792ea' : '#f6b26b', m.index); last = TOK.lastIndex; }
+    seg(line.slice(last), '#e6e6e6', last);
+  }
+  ptex.needsUpdate = true;
+}
+const logEl = document.getElementById('log');
+function tl(t, cls = '') { const d = document.createElement('div'); d.textContent = t; if (cls) d.className = cls; logEl.append(d); logEl.scrollTop = logEl.scrollHeight; }
+
+// ---------- 文字だけの画面 ----------
+const cardEl = document.getElementById('card'), cardMain = document.getElementById('cardMain'), cardSub = document.getElementById('cardSub');
+const PAIRS = [['#0b0b0b', '#f2f2f2']]; let cardN = 0;
+function card(main, sub, ms, small = false, pair = null) {
+  const [bg, fg] = pair || PAIRS[cardN++ % PAIRS.length];
+  cardEl.className = small ? 'small' : ''; cardEl.style.background = bg; cardEl.style.color = fg;
+  cardMain.textContent = main; cardSub.textContent = sub || ''; cardEl.style.display = 'flex';
+  return new Promise(r => setTimeout(() => { cardEl.style.display = 'none'; r(); }, ms));
+}
+const wait = ms => new Promise(r => setTimeout(r, ms));
+
+// ---------- 操作 ----------
+let mode = 'dir', busy = false, zoom = 0, err = false;
+function hud() {
+  document.getElementById('mode').textContent = mode === 'dir' ? 'フォルダの世界' : 'コードの世界';
+  document.getElementById('crumb').textContent = mode === 'dir' ? 'my-world /' : 'my-world / src / server.ts';
+}
+function applyErr() {
+  mat.acc.color.set(err ? C.err : C.own); storeObj.userData.edges.material.color.set(err ? C.err : C.line);
+  gapTile.visible = !err; rowsOk.visible = !err; rowsBad.visible = err;
+}
+async function dive() {
+  if (busy) return; busy = true;
+  if (mode === 'dir') {
+    tl('$ $EDITOR src/server.ts', 'in'); zoom = 1; await wait(650);
+    await card('src/server.ts', '48 LINES', 420);
+    mode = 'code'; dirWorld.visible = false; codeWorld.visible = true; zoom = 0; resetRide();
+  } else {
+    await card('src/', 'CLOSE', 360); tl('$ ls src', 'in'); tl('db  fragment.ts  routes  server.ts  store.ts');
+    mode = 'dir'; dirWorld.visible = true; codeWorld.visible = false;
+  }
+  hud(); renderEditor(); busy = false;
+}
+async function toggleErr() {
+  if (busy) return; busy = true; err = !err; tl('$ curl -i localhost:8080/fragments/7', 'in');
+  if (err) {
+    await card('500', 'INTERNAL SERVER ERROR', 520, false, ['#0b0b0b', '#e2231a']);
+    tl('HTTP/1.1 500 Internal Server Error', 'err');
+    tl("TypeError: Cannot read properties of undefined (reading 'payload')", 'err'); tl('    at Server.<anonymous> (src/server.ts:23:36)', 'err');
+  } else { tl('HTTP/1.1 200 OK', 'ok'); }
+  applyErr(); if (mode === 'code') resetRide(); renderEditor(); busy = false;
+}
+const COMMITS = ['a3f91c2  断片の型を定義する', '4be07d1  検査を追加する', '9c2e5aa  空の payload を拒否する', 'e18b3f0  保存の処理を分ける',
+  '71d4c9e  DB につなぐ', '0fa62b7  取得の問い合わせを書く', 'c5539d4  テストを足す', '83c1d0a  TODO: 復元を試す', '5d20a18  デプロイの手順を書く'];
+async function montage() {
+  if (busy) return; busy = true; tl('$ git log --oneline', 'in');
+  for (const c of COMMITS) { tl(c, 'dim'); await card(c, '', 620, true); await wait(110); }   // 読める速さ
+  busy = false;
+}
+addEventListener('keydown', e => { if (e.key === 'Enter') dive(); else if (/^e$/i.test(e.key)) toggleErr(); else if (/^g$/i.test(e.key)) montage(); });
+
+// ---------- ループ ----------
+const clock = new THREE.Clock(); let T = 0; const look = new V3(0, 26, -70), pos = new V3(0, 10, 70);
+function frame() {
+  const dt = Math.min(clock.getDelta(), .05); T += dt;
+  if (mode === 'dir') {
+    const rest = new V3(Math.sin(T * .17) * 6, 10 + Math.sin(T * .11) * 1.2, 70), tgt = new V3(serverTs.x, 13, serverTs.z + 10);
+    pos.lerp(zoom ? tgt : rest, zoom ? .1 : .05); look.lerp(zoom ? new V3(serverTs.x, 10, serverTs.z) : new V3(0, 24, -70), zoom ? .1 : .05);
+    camera.fov += ((zoom ? 26 : 50) - camera.fov) * .1;
+  } else {
+    ride(dt); pos.copy(rpos); look.lerp(rlook, .09); camera.fov += (64 - camera.fov) * .1;
+  }
+  camera.position.copy(pos); camera.lookAt(look); camera.updateProjectionMatrix();
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+
+resize(); hud(); renderEditor(); applyErr();
+tl('$ ls', 'in'); tl('README.md  node_modules  package-lock.json  package.json  scripts  src  tests  tsconfig.json');
+tl('(この試作のターミナルは表示だけです。操作は上のキーで行います)', 'dim');
+window.__v = { dive, toggleErr, montage, state: () => ({ mode, busy, err }) };
+frame();
+</script>
+</body>
+</html>
