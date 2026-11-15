@@ -1,6 +1,7 @@
 # 0001 — Steam での配信を最初から目指し、本物の環境はプレイヤーの PC で動かす
 
-- **Status**: Accepted(技術の中身は未検証。下の「未検証」を参照)
+- **Status**: Accepted(技術の中身は未検証。下の「未検証」を参照)。
+  **決定の 2 と 3(TypeScript + Three.js、Electron)は [0002](0002-rust-and-bevy.md) で置き換えた**
 - **Date**: 2026-11-15
 - **Deciders**: RintaroYamaoka (本人決定) / Claude
 
