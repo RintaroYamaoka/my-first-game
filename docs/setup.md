@@ -31,25 +31,39 @@
 ## 動かし方
 
 ```
-cargo run -p world-from-code                 # WSL の窓で動かす(確認用)
-cargo build -p world-from-code --target x86_64-pc-windows-gnu   # Windows 用に作る
+cargo run -p world-from-code                          # WSL の窓で動かす(手早い確認用)
+./scripts/run-windows.sh world-from-code <引数...>     # Windows 用に作って、Windows で動かす
 ```
 
 - WSL の窓は、GPU を使わずソフトウェアで描く。動くことの確認に使い、速さは測らない
-- 速さと滑らかさは、Windows 用に作った実行ファイルを Windows で動かして測る
+- 速さと滑らかさは、Windows で動かして見る。`run-windows.sh` は実行ファイルを
+  `%LOCALAPPDATA%\my-first-game\dev\` に置いて起動する
+- 2026-11-16 に確認: Windows で起動し、GPU(NVIDIA GeForce RTX 5070 Laptop、Vulkan)で描けた。WSL の窓と同じ絵になった
+- Windows 用の最初のビルドは 10 分ほど。作り直しは 10 秒ほど
 
-## 分かっている制約
+## Windows の保護機能との関係
 
-- **この PC の Windows は、署名のない実行ファイルの起動を止める**(2026-11-16 に確認)。WSL で作った
-  Windows 用の実行ファイルを起動すると「組織の Device Guard ポリシーによってブロックされました」と出る。
-  Windows の保護機能(スマート アプリ コントロール、または管理者が入れたアプリ制御)によるもので、
-  回避はしない。どう扱うかは本人が決める(下の「決めていないこと」)
-- そのため、Windows での速さと滑らかさの計測は、まだできていない
+- Windows のスマート アプリ コントロールが「オン」だと、自作の実行ファイルは起動を止められる
+  (「組織の Device Guard ポリシーによってブロックされました」と出る)。署名がなく、Microsoft が安全と
+  判断できないため。作り方を変えても同じ
+- **この PC では、本人がオフにした(2026-11-16)。** PC は本人の個人のもの。開発をやめるときはオンに戻せる
+- この設定は本人が決めて本人が操作する。Claude は触らない
+
+### スマート アプリ コントロールについて調べたこと(2026-11-16)
+
+- 2026 年 4 月の更新(26200.8116 以降)から、オフにしても Windows を入れ直さずにオンへ戻せる。この PC は 26200.9974
+- 2026 年 10 月の更新で「オンに戻せない」不具合が出たが、11 月初めに修正された。切り替える前に Windows Update を最新にする
+- Microsoft の案内でも、開発中はオフにするのが正式な方法の一つ。ほかに、評価モードで試す、署名する、開発用の仮想マシンを使う
+- 切り替える場所: 設定 → プライバシーとセキュリティ → Windows セキュリティ → アプリとブラウザーの制御 →
+  スマート アプリ コントロールの設定
+- オフにしても、ウイルス対策と SmartScreen の警告は残る
+
+出典: <https://blog-en.topedia.com/2026/04/smart-app-control-in-windows-11-can-now-be-re-enabled-without-reinstalling/>、
+<https://bleepingcomputer.com/news/microsoft/microsoft-fixes-smart-app-control-broken-by-october-windows-update>、
+<https://learn.microsoft.com/en-ca/answers/questions/5872161/smart-app-control-blocks-winforms-wpf-sample-appli>
 
 ## 決めていないこと
 
-- **Windows 用の実行ファイルを、この PC でどう動かすか。** 候補: 保護機能の設定を本人が確認して見直す /
-  別の Windows の PC で動かす / 実行ファイルに署名する。Steam で配る実行ファイルも、いずれ同じ種類の
-  保護機能に当たるので、署名は発売までに必ず決める必要がある
+- **発売する実行ファイルの署名。** 買った人の PC でも同じ保護機能が働くので、段階 6 より前に調査して決める
 - Windows 用のビルドは、今は WSL から作る方式(`x86_64-pc-windows-gnu`)。Steam の部品とつなぐ実験で
   うまくいかなければ、Windows に Microsoft のビルド道具を入れる方式に変える

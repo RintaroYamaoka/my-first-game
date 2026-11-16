@@ -166,13 +166,15 @@ fn labels(scape: Res<Scape>, cam: Single<(&Camera, &GlobalTransform)>, mut q: Qu
 }
 
 /// SHOT が指定されていたら、画面を 1 枚撮って終わる(自動で確かめるため)
-fn shot(mut commands: Commands, mut frame: Local<u32>, mut exit: MessageWriter<AppExit>) {
+fn shot(mut commands: Commands, time: Res<Time>, mut taken: Local<bool>, mut exit: MessageWriter<AppExit>) {
     let Ok(path) = std::env::var("SHOT") else { return };
-    *frame += 1;
-    if *frame == 40 {
+    // 枚数ではなく時間で待つ。GPU が速いと、描画の準備(シェーダー)が終わる前に規定の枚数に届いてしまう
+    let t = time.elapsed_secs();
+    if t > 3.0 && !*taken {
+        *taken = true;
         commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
     }
-    if *frame == 80 {
+    if t > 4.5 {
         exit.write(AppExit::Success);
     }
 }
