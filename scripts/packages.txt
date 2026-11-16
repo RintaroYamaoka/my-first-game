@@ -1,0 +1,10 @@
+# 開発に要る OS の部品(Ubuntu)。1 行に 1 つ。# 以降は説明
+build-essential        # C のコンパイラとリンカ
+pkg-config             # 部品の場所を調べる道具。下の -dev を使うのに要る
+libasound2-dev         # 音(Bevy の音の機能)
+libasound2-plugins     # 音を WSL から Windows へ流す
+libudev-dev            # ゲームパッド
+libwayland-dev         # 窓(Wayland)
+libxkbcommon-dev       # キーボード入力
+libxkbcommon-x11-0     # キーボード入力(X11)
+mingw-w64              # Windows 用の実行ファイルを作る

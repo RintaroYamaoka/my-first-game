@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>nest — 入れ子の箱(仮)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #efefec; overflow: hidden; }
+  canvas { display: block; }
+  .hud { position: fixed; pointer-events: none; user-select: none;
+         font-family: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace; }
+  #path  { left: 26px; top: 22px; font-size: 14px; color: #111; letter-spacing: .02em; }
+  #path .sep { color: #aaa; padding: 0 .5em; }
+  #path .sel { color: #e5432a; }
+  #law   { left: 26px; top: 48px; font-size: 12px; color: #888;
+           font-family: system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  #depth { right: 26px; top: 22px; font-size: 12px; color: #888; text-align: right; line-height: 1.7; }
+  #depth b { color: #111; font-size: 22px; font-weight: 600; }
+  #keys  { left: 26px; bottom: 20px; font-size: 12px; color: #999;
+           font-family: system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  #keys kbd { font-family: ui-monospace, Menlo, Consolas, monospace; color: #444;
+              border: 1px solid #bbb; border-radius: 3px; padding: 0 5px; margin: 0 2px 0 10px; background: #f6f6f4; }
+  #keys kbd:first-child { margin-left: 0; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="path" class="hud"></div>
+<div id="law" class="hud"></div>
+<div id="depth" class="hud"></div>
+<div id="keys" class="hud">
+  <kbd>←</kbd><kbd>→</kbd>選ぶ
+  <kbd>Enter</kbd>潜る
+  <kbd>Backspace</kbd>戻る
+  <kbd>Space</kbd>裏(本物の中身)を見る
+  <span style="margin-left:14px">マウス: 重ねて選ぶ / クリックかホイールで潜る / 右クリックで戻る</span>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+
+// ───────────────────────── 調整する数値 ─────────────────────────
+const CFG = {
+  bg: '#efefec', ink: '#111111', accent: '#e5432a', typeInk: '#8c8c8c',
+  fov: 36, yaw: -0.34, pitch: 0.21, fitMargin: 0.7, fitBack: 1.12,
+  diveSec: 1.15,
+  line: 1.5, lineSel: 2.8, lineThin: 1.0,
+};
+const W = 1.6, H = 1, D = 1;           // 箱の内側の基準の大きさ
+
+// ───────────────────────── 世界の中身(本物のコード) ─────────────────────────
+const SRC_SERVER = `import http from "node:http";
+import { z } from "zod";
+import { find } from "./store";
+
+const Id = z.string().regex(/^f-\\d{4}$/);
+
+function handle(req, res) {
+  const id = parse(req.url);
+  if (!id) {
+    res.writeHead(400);
+    return res.end();
+  } else {
+    const f = find(id);
+    res.end(JSON.stringify(f));
+  }
+}
+
+http.createServer(handle).listen(8080);`;
+const SRC_HANDLE = `function handle(req, res) {
+  const id = parse(req.url);
+  if (!id) {
+    res.writeHead(400);
+    return res.end();
+  } else {
+    const f = find(id);
+    res.end(JSON.stringify(f));
+  }
+}`;
+const SRC_IF = `if (!id) {
+  res.writeHead(400);
+  return res.end();
+} else {
+  const f = find(id);
+  res.end(JSON.stringify(f));
+}`;
+const SRC_FRAGMENT = `export interface Fragment {
+  id: string;
+  body: string;
+  at: number;
+}`;
+const SRC_STORE = `import type { Fragment } from "./fragment";
+
+export const store: Fragment[] = load();
+
+export function find(id: string) {
+  for (const f of store) {
+    if (f.id === id) return f;
+  }
+  return null;
+}`;
+const SRC_FIND = `export function find(id: string) {
+  for (const f of store) {
+    if (f.id === id) return f;
+  }
+  return null;
+}`;
+const SRC_TEST = `import { test, expect } from "vitest";
+import { setup } from "./missing";
+
+test("400 without id", async () => {
+  const res = await get("/fragment/");
+  expect(res.status).toBe(400);
+});
+
+test("finds a fragment", async () => {
+  const res = await get("/fragment/f-0042");
+  expect(res.status).toBe(200);
+});`;
+
+const box = (name, kind, opt = {}, kids = []) => ({ name, kind, kids, ...opt });
+const val = (name, value, opt = {}) => ({ name, kind: 'value', value, kids: [], dims: [1.6, 0.6, 0.6], ...opt });
+
+const bodies = ['"first light"', '"a door, half open"', '"what the log said"', '"nothing yet"', '"return"'];
+const pkgNames = ['zod', 'typescript', 'vitest', 'tsx', 'esbuild', 'vite', 'chai', 'rollup', 'picocolors',
+                  'nanoid', 'postcss', 'magic-string', 'tinybench', 'debug', 'ms', 'estree-walker'];
+const modules = [];
+for (let i = 0; i < 112; i++) modules.push(box(pkgNames[i] || '', 'package', {}, []));
+
+const tree = box('world/', 'folder', {}, [
+  box('src/', 'folder', { w: 1.25 }, [
+    box('server.ts', 'file', { w: 1.2, src: SRC_SERVER }, [
+      box('import http', 'stmt', { w: .7, src: 'import http from "node:http";' }, [val('from', '"node:http"')]),
+      box('import { z }', 'stmt', { w: .7, src: 'import { z } from "zod";' }, [val('from', '"zod"')]),
+      box('import { find }', 'stmt', { w: .7, src: 'import { find } from "./store";' }, [val('from', '"./store"')]),
+      box('handle()', 'fn', { w: 1.25, src: SRC_HANDLE }, [
+        box('const id', 'stmt', { src: 'const id = parse(req.url);' }, [
+          val('req.url', '"/fragment/f-0042"'), val('id', '"f-0042"')]),
+        box('if (!id)', 'branch', { w: 1.2, src: SRC_IF }, [
+          val('!id', 'false'),
+          box('then { }', 'block', { src: 'res.writeHead(400);\nreturn res.end();' }, [
+            box('res.writeHead()', 'stmt', { src: 'res.writeHead(400);' }, [val('status', '400')]),
+            box('return', 'stmt', { src: 'return res.end();' }, [val('res.end()', 'undefined')]),
+          ]),
+          box('else { }', 'block', { src: 'const f = find(id);\nres.end(JSON.stringify(f));' }, [
+            box('const f', 'stmt', { src: 'const f = find(id);' }, [
+              val('id', '"f-0042"'), val('f', '{ id, body, at }')]),
+            box('res.end()', 'stmt', { src: 'res.end(JSON.stringify(f));' }, [
+              val('body', '{"id":"f-0042",…}')]),
+          ]),
+        ]),
+      ]),
+      box('listen()', 'stmt', { src: 'http.createServer(handle).listen(8080);' }, [
+        val('port', '8080'), val('requests', '1,204,118', { tick: true })]),
+    ]),
+    box('fragment.ts', 'file', { w: .8, src: SRC_FRAGMENT }, [
+      box('interface Fragment', 'type', { src: SRC_FRAGMENT }, [
+        val('id', 'string', { type: true }), val('body', 'string', { type: true }), val('at', 'number', { type: true })]),
+    ]),
+    box('store.ts', 'file', { src: SRC_STORE }, [
+      box('store', 'array', { src: 'export const store: Fragment[] = load();' },
+        [0, 1, 2, 3, 4].map(i => box(`[${i}]`, 'struct', {}, [
+          val('id', `"f-00${40 + i}"`), val('body', bodies[i]), val('at', String(1763251200 + i * 37))]))),
+      box('find()', 'fn', { src: SRC_FIND }, [
+        box('for (f of store)', 'loop', { w: 1.2, src: 'for (const f of store) {\n  if (f.id === id) return f;\n}' },
+          [0, 1, 2, 3, 4].map(i => box(`f = store[${i}]`, 'stmt', { src: 'if (f.id === id) return f;' }, [
+            val('f.id', `"f-00${40 + i}"`), val('f.id === id', i === 2 ? 'true' : 'false')]))),
+        box('return', 'stmt', { src: 'return null;' }, [val('value', 'null')]),
+      ]),
+    ]),
+  ]),
+  box('test/', 'folder', { w: .8 }, [
+    box('server.test.ts', 'file', { src: SRC_TEST }, [
+      box('import "./missing"', 'stmt', { w: .7, src: 'import { setup } from "./missing";' }, [val('from', '"./missing"')]),
+      box('test("400 without id")', 'fn', {}, [val('res.status', '400'), val('expect', '400')]),
+      box('test("finds a fragment")', 'fn', {}, [val('res.status', '200'), val('expect', '200')]),
+    ]),
+  ]),
+  box('node_modules/', 'modules', { w: 1.55 }, modules),
+  box('package.json', 'struct', { w: .62 }, [
+    val('name', '"world"'), val('type', '"module"'), val('dependencies', '{ zod }')]),
+  box('README.md', 'file', { w: .5, src: '# world' }, [val('#', 'world')]),
+]);
+
+// 箱から別の箱へ伸びる線(参照)。to が null のものは、参照先がない
+const LINKS = [
+  { from: ['src/', 'server.ts', 'import { z }'], to: ['node_modules/', 'zod'] },
+  { from: ['src/', 'server.ts', 'import { find }'], to: ['src/', 'store.ts', 'find()'] },
+  { from: ['src/', 'server.ts', 'handle()', 'if (!id)', 'else { }', 'const f'], to: ['src/', 'store.ts', 'find()'] },
+  { from: ['src/', 'store.ts', 'store'], to: ['src/', 'fragment.ts', 'interface Fragment'] },
+  { from: ['test/', 'server.test.ts', 'import "./missing"'], to: null },
+];
+
+const LAW = {
+  folder:  ['フォルダ', '中の箱が、大きさに応じて棚のように並ぶ'],
+  modules: ['依存パッケージ', '自分の手で入れた、他人が創った世界'],
+  package: ['パッケージ', '中は見えない'],
+  file:    ['ファイル', '宣言が、書かれた順に並ぶ'],
+  fn:      ['関数', '文が、実行の順に並ぶ'],
+  block:   ['ブロック', '文が、実行の順に並ぶ'],
+  stmt:    ['文', '値がそのまま浮いている'],
+  branch:  ['分岐', '列が二つに分かれて、また一つに戻る'],
+  loop:    ['ループ', '列が輪になる'],
+  array:   ['配列', '同じ形の箱が、番号順に並ぶ'],
+  struct:  ['インスタンス', '型の枠に、値が入っている'],
+  type:    ['型', '線だけの枠。値はまだない'],
+  value:   ['値', 'これより下はない'],
+};
+
+// ───────────────────────── 並び方の法則 ─────────────────────────
+const dims = n => n.dims || [W, H, D];
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+const LAYOUT = {
+  shelf(n) {
+    const ks = n.kids, half = Math.ceil(ks.length / 2);
+    const rows = ks.length > 4 ? [ks.slice(0, half), ks.slice(half)] : [ks];
+    rows.forEach((row, ri) => {
+      const base = rows.length === 1 ? -0.16 : (ri === 0 ? 0.0 : -0.4);
+      const z = rows.length === 1 ? 0 : (ri === 0 ? -0.2 : 0.22);
+      const gap0 = 0.08;
+      let ss = row.map(k => 0.22 * (k.w || 1));
+      const total0 = row.reduce((a, k, i) => a + dims(k)[0] * ss[i], 0) + gap0 * (row.length - 1);
+      const f = Math.min(1, 1.26 / total0);
+      ss = ss.map(s => s * f);
+      let x = -total0 * f / 2;
+      row.forEach((k, i) => { const d = dims(k), w = d[0] * ss[i];
+        k.s = ss[i]; k.pos = [x + w / 2, base + d[1] * ss[i] / 2, z]; x += w + gap0 * f; });
+    });
+  },
+  seq(n) {
+    const ks = n.kids, N = ks.length, [w] = dims(n), slot = w * 0.9 / N;
+    ks.forEach((k, i) => { const d = dims(k), cap = k.kind === 'value' ? 0.36 : 0.25 * Math.min(1, k.w || 1);
+      k.s = Math.min(cap, slot * 0.8 / d[0]); k.pos = [-w * 0.45 + slot * (i + .5), 0, 0]; });
+    n.paths = [[[-w / 2, 0, 0], ...ks.map(k => k.pos), [w / 2, 0, 0]]];
+  },
+  branch(n) {
+    const [c, t, e] = n.kids, [w] = dims(n);
+    c.s = 0.17; c.pos = [-0.5, 0, 0];
+    t.s = 0.2;  t.pos = [0.16, 0.24, 0];
+    if (e) { e.s = 0.2; e.pos = [0.16, -0.24, 0]; }
+    const j = [0.66, 0, 0];
+    n.paths = [[[-w / 2, 0, 0], c.pos], [c.pos, [-0.22, 0.24, 0], t.pos, [0.52, 0.24, 0], j],
+               [c.pos, [-0.22, -0.24, 0], ...(e ? [e.pos] : []), [0.52, -0.24, 0], j], [j, [w / 2, 0, 0]]];
+  },
+  ring(n) {
+    const ks = n.kids, N = ks.length, [w] = dims(n);
+    const at = t => [0.5 * Math.cos(t), 0.2 * Math.sin(t), 0.34 * Math.sin(t)];
+    ks.forEach((k, i) => { k.s = Math.min(0.17, 1.05 / N); k.pos = at(Math.PI - (i + .5) / N * Math.PI * 2); });
+    const loop = []; for (let i = 0; i <= 72; i++) loop.push(at(i / 72 * Math.PI * 2));
+    n.paths = [loop, [[-w / 2, 0, 0], at(Math.PI)], [at(0), [w / 2, 0, 0]]];
+  },
+  array(n) {
+    const ks = n.kids, N = ks.length, [w] = dims(n), slot = w * 0.92 / N;
+    ks.forEach((k, i) => { k.s = Math.min(0.2, slot * 0.82 / dims(k)[0]); k.pos = [-w * 0.46 + slot * (i + .5), 0, 0]; });
+  },
+  stack(n) {
+    const ks = n.kids, N = ks.length, [, h] = dims(n), slot = h * 0.78 / N;
+    ks.forEach((k, i) => { k.s = Math.min(0.5, slot * 0.78 / dims(k)[1]); k.pos = [0, h * 0.39 - slot * (i + .5) - 0.03, 0]; });
+  },
+  grid(n) {
+    const r = rng(7), nx = 7, ny = 4, nz = 4;
+    n.kids.forEach((k, i) => { const ix = i % nx, iy = Math.floor(i / nx) % ny, iz = Math.floor(i / (nx * ny));
+      k.s = 0.036 + r() * 0.05;
+      k.pos = [-0.66 + ix * 0.22 + (r() - .5) * .05, 0.33 - iy * 0.22 + (r() - .5) * .05, -0.36 + iz * 0.24 + (r() - .5) * .05]; });
+  },
+};
+const LAYOUT_OF = { folder: 'shelf', modules: 'grid', file: 'seq', fn: 'seq', block: 'seq', stmt: 'seq',
+                    branch: 'branch', loop: 'ring', array: 'array', struct: 'stack', type: 'stack' };
+
+// ───────────────────────── 描画の土台 ─────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(CFG.bg);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const cam = new THREE.PerspectiveCamera(CFG.fov, 1, 0.02, 6000);
+scene.add(new THREE.AmbientLight(0xffffff, Math.PI * 0.62));
+const sun = new THREE.DirectionalLight(0xffffff, Math.PI * 0.5);
+sun.position.set(0.5, 0.8, 0.35); scene.add(sun);
+const root = new THREE.Group(); scene.add(root);
+
+const INK = new THREE.Color(CFG.ink), ACCENT = new THREE.Color(CFG.accent), TYPEINK = new THREE.Color(CFG.typeInk);
+const unitBox = new THREE.BoxGeometry(1, 1, 1);
+const edgeGeo = (() => { const p = [], h = .5;
+  for (const a of [-h, h]) for (const b of [-h, h]) { p.push(-h, a, b, h, a, b,  a, -h, b, a, h, b,  a, b, -h, a, b, h); }
+  return new LineSegmentsGeometry().setPositions(p); })();
+const lineMats = [];
+function lineMat(color, width) { const m = new LineMaterial({ color, linewidth: width, transparent: true });
+  lineMats.push(m); return m; }
+function polyline(paths, color, width) {
+  const p = []; for (const path of paths) for (let i = 0; i < path.length - 1; i++) p.push(...path[i], ...path[i + 1]);
+  const l = new LineSegments2(new LineSegmentsGeometry().setPositions(p), lineMat(color, width)); l.frustumCulled = false; return l;
+}
+
+const FONT = 'ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace';
+function textSprite(text, weight = 500) {
+  const c = document.createElement('canvas'), x = c.getContext('2d'), px = 64;
+  x.font = `${weight} ${px}px ${FONT}`;
+  c.width = Math.ceil(x.measureText(text).width) + 16; c.height = 88;
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+  const draw = t => { x.clearRect(0, 0, c.width, c.height); x.font = `${weight} ${px}px ${FONT}`; x.fillStyle = '#fff';
+    x.textBaseline = 'middle'; x.fillText(t, 8, c.height / 2 + 2); tex.needsUpdate = true; };
+  draw(text);
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
+  sp.userData = { aspect: c.width / c.height, draw };
+  return sp;
+}
+function codePanel(n) {
+  const [w, h, d] = [n.dw, n.dh, n.dd], cw = 1024, ch = Math.round(1024 * h / w);
+  const c = document.createElement('canvas'); c.width = cw; c.height = ch;
+  const x = c.getContext('2d'); x.fillStyle = '#0b0b0b'; x.fillRect(0, 0, cw, ch);
+  const lines = n.srcText.split('\n'), maxLen = Math.max(...lines.map(l => l.length), 8);
+  const fs = Math.max(11, Math.min(40, (ch - 130) / (lines.length * 1.45), (cw - 110) / (maxLen * 0.61)));
+  x.textBaseline = 'top';
+  x.font = `500 19px ${FONT}`; x.fillStyle = '#6f6f6f'; x.fillText(pathOf(n), 54, 40);
+  x.font = `500 ${fs}px ${FONT}`;
+  lines.forEach((l, i) => { x.fillStyle = l.trim().startsWith('//') || l.startsWith('$') ? '#7d7d7d' : '#ececec';
+    x.fillText(l, 54, 92 + i * fs * 1.45); });
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true }));
+  m.rotation.y = Math.PI; m.position.z = -d / 2 - 0.002;
+  return m;
+}
+
+// ───────────────────────── 木を世界にする ─────────────────────────
+const all = [];
+function pathOf(n) { const a = []; for (let m = n; m; m = m.parent) a.unshift(m.name); return a.join(' › '); }
+function autoSrc(n) {
+  if (n.kind === 'value') return `${n.name}: ${n.value}`;
+  if (n.kind === 'folder' || n.kind === 'modules') {
+    const names = n.kids.map(k => k.name).filter(Boolean);
+    return `$ ls ${n.name}\n` + names.slice(0, 13).join('\n') + (n.kids.length > 13 ? `\n… (${n.kids.length})` : '');
+  }
+  if (n.kind === 'package') return `$ ls node_modules/${n.name || '…'}\npackage.json\ndist/\nLICENSE`;
+  return n.kids.map(k => k.kind === 'value' ? `${k.name}: ${k.value}` : k.name).join('\n') || n.name;
+}
+function build(n, parent, depth) {
+  n.parent = parent; n.depth = depth; all.push(n);
+  [n.dw, n.dh, n.dd] = dims(n);
+  n.S = parent ? parent.S * n.s : 1;
+  n.P = parent ? parent.P.map((v, i) => v + parent.S * n.pos[i]) : [0, 0, 0];
+  n.ctx = 0; n.open = 0; n.selF = 0; n.sel = 0;
+  n.srcText = n.src || autoSrc(n);
+  const g = n.g = new THREE.Group();
+  if (parent) { g.position.set(...n.pos); g.scale.setScalar(n.s); parent.g.add(g); } else root.add(g);
+
+  n.noFace = n.kind === 'value' || n.kind === 'type';
+  n.mesh = new THREE.Mesh(unitBox, new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true,
+    polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }));
+  n.mesh.scale.set(n.dw, n.dh, n.dd); n.mesh.renderOrder = 100 - depth; n.mesh.visible = false; g.add(n.mesh);
+
+  n.baseInk = n.kind === 'type' || n.type ? TYPEINK : INK;
+  n.edges = new LineSegments2(edgeGeo, lineMat(n.baseInk, n.kind === 'value' ? CFG.lineThin : CFG.line));
+  n.edges.scale.set(n.dw, n.dh, n.dd); g.add(n.edges);
+
+  if (n.name) { const sp = n.label = textSprite(n.name), hh = 0.2; sp.renderOrder = 300;
+    sp.center.set(0, 0); sp.scale.set(hh * sp.userData.aspect, hh, 1); sp.position.set(-n.dw / 2, n.dh / 2 + 0.035, n.dd / 2);
+    g.add(sp); }
+  if (n.kind === 'value') { const sp = n.valueSp = textSprite(n.value, 600); let hh = 0.3; sp.renderOrder = 300;
+    if (hh * sp.userData.aspect > n.dw * 0.9) hh = n.dw * 0.9 / sp.userData.aspect;
+    sp.scale.set(hh * sp.userData.aspect, hh, 1); sp.material.color.copy(n.type ? TYPEINK : INK); g.add(sp); }
+
+  const lay = LAYOUT_OF[n.kind];
+  if (lay && n.kids.length) LAYOUT[lay](n);
+  if (n.paths) { n.pathLine = polyline(n.paths, INK, CFG.lineThin); g.add(n.pathLine); }
+  n.kids.forEach(k => build(k, n, depth + 1));
+}
+build(tree, null, 0);
+
+const byPath = p => p.reduce((n, name) => n && n.kids.find(k => k.name === name), tree);
+const chainOf = n => { const a = []; for (let m = n; m; m = m.parent) a.unshift(m); return a; };
+for (const L of LINKS) {
+  const a = byPath(L.from); if (!a) { console.warn('link from?', L.from); continue; }
+  let owner, pts;
+  if (L.to) {
+    const b = byPath(L.to); if (!b) { console.warn('link to?', L.to); continue; }
+    const ca = chainOf(a), cb = chainOf(b); let i = 0; while (ca[i + 1] && ca[i + 1] === cb[i + 1]) i++;
+    owner = ca[i];
+    const rel = n => n.P.map((v, k) => (v - owner.P[k]) / owner.S);
+    const pa = rel(a), pb = rel(b), lift = 0.5 * Math.hypot(pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]);
+    const mid = [(pa[0] + pb[0]) / 2, Math.max(pa[1], pb[1]) + lift * 0.5, (pa[2] + pb[2]) / 2 + lift * 0.3];
+    pts = []; for (let t = 0; t <= 24; t++) { const u = t / 24, v = 1 - u;
+      pts.push([0, 1, 2].map(k => v * v * pa[k] + 2 * v * u * mid[k] + u * u * pb[k])); }
+  } else {                                   // 参照先がない: 線が何もない場所で途切れる
+    owner = a.parent;
+    const pa = a.pos; pts = [pa, [pa[0] + 0.05, pa[1] + 0.3, pa[2] + 0.15], [pa[0] + 0.32, pa[1] + 0.36, pa[2] + 0.3]];
+  }
+  const line = polyline([pts], INK, CFG.lineThin); owner.g.add(line);
+  (owner.links ||= []).push(line);
+}
+
+// ───────────────────────── 状態 ─────────────────────────
+let focus = tree, selected = null;
+const view = { p: [0, 0, 0], s: 1, dist: 3 };
+let tr = null, flip = 0, flipT = 0;
+const mouse = { x: 0, y: 0, sx: 0, sy: 0, moved: false };
+let pickList = [];
+
+const fit = (n, margin = CFG.fitMargin) => { const t = Math.tan(THREE.MathUtils.degToRad(CFG.fov / 2));
+  return Math.max(n.dh / 2 / t, n.dw / 2 / (t * cam.aspect)) * margin + n.dd / 2; };
+
+function setFocus(n, keepSel) {
+  focus = n; flipT = 0;
+  const chain = new Set(chainOf(n));
+  for (const m of all) { m.onChain = chain.has(m); m.inSub = !!m.parent && (m.parent === focus || m.parent.inSub); }
+  if (keepSel) n.sel = Math.max(0, n.kids.indexOf(keepSel));
+  selected = n.kids[n.sel] || null;
+  pickList = n.kids.map(k => k.mesh);
+  tr = { p0: view.p.slice(), s0: view.s, d0: view.dist, p1: n.P, s1: n.S, d1: fit(n), t: 0,
+         dur: CFG.diveSec * (view.s === n.S ? 0.01 : 1) };
+  hud();
+}
+function select(i) { if (!focus.kids.length) return; const N = focus.kids.length;
+  focus.sel = ((i % N) + N) % N; selected = focus.kids[focus.sel]; hud(); }
+const dive = () => { if (selected) setFocus(selected); };
+const rise = () => { if (focus.parent) setFocus(focus.parent, focus); };
+
+function hud() {
+  const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const parts = chainOf(focus).map(n => esc(n.name));
+  if (selected && selected.name) parts.push(`<span class="sel">${esc(selected.name)}</span>`);
+  document.getElementById('path').innerHTML = parts.join('<span class="sep">›</span>');
+  const [k, l] = LAW[focus.kind] || ['', ''];
+  document.getElementById('law').textContent = `${k} — ${l}`;
+  document.getElementById('depth').innerHTML = `<b>${focus.depth}</b><br>深さ`;
+}
+
+// ───────────────────────── 入力 ─────────────────────────
+addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') select(focus.sel + 1);
+  else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') select(focus.sel - 1);
+  else if (e.key === 'Enter') dive();
+  else if (e.key === 'Backspace' || e.key === 'Escape') rise();
+  else if (e.key === ' ') flipT = flipT ? 0 : Math.PI;
+  else return;
+  e.preventDefault();
+});
+addEventListener('mousemove', e => { mouse.x = e.clientX / innerWidth * 2 - 1; mouse.y = -(e.clientY / innerHeight * 2 - 1); mouse.moved = true; });
+addEventListener('click', () => { if (!tr) dive(); });
+addEventListener('contextmenu', e => { e.preventDefault(); rise(); });
+let wheelAcc = 0, wheelLock = 0;
+addEventListener('wheel', e => { if (performance.now() < wheelLock) return; wheelAcc += e.deltaY;
+  if (Math.abs(wheelAcc) > 50) { wheelAcc < 0 ? dive() : rise(); wheelAcc = 0; wheelLock = performance.now() + 550; } }, { passive: true });
+function resize() { renderer.setSize(innerWidth, innerHeight); cam.aspect = innerWidth / innerHeight; cam.updateProjectionMatrix();
+  for (const m of lineMats) m.resolution.set(innerWidth, innerHeight); if (!tr) view.dist = fit(focus); }
+addEventListener('resize', resize);
+
+// ───────────────────────── 毎フレーム ─────────────────────────
+const sm = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+const ease = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const ray = new THREE.Raycaster();
+
+function show(obj, alpha) { obj.visible = alpha > 0.01; if (obj.visible) obj.material.opacity = alpha; }
+
+function draw(n) {
+  // a: 画面の中での見かけの大きさ(1 = いま中にいる箱)。見え方はすべてこれで決まる
+  const a = n.S / view.s * Math.max(n.dw / 1.6, n.dh);
+  if (n.ctx < 0.012 || a < 0.004) { n.g.visible = false; return; }
+  n.g.visible = true;
+  const near = sm(0.004, 0.012, a), ctxHi = sm(0.55, 1, n.ctx);
+
+  const faceA = n.noFace ? 0 : near * (1 - sm(0.36, 0.8, a)) * ctxHi * (1 - 0.9 * n.open);
+  show(n.mesh, faceA); n.mesh.material.depthWrite = faceA > 0.6;
+
+  const far = a > 1.2 ? Math.max(0.1, Math.pow(1.2 / a, 0.55)) * (1 - sm(500, 900, a)) : 1;
+  show(n.edges, near * far * n.ctx * (n.kind === 'value' ? 0.55 + 0.45 * n.selF : 1));
+  n.edges.material.color.copy(n.baseInk).lerp(ACCENT, n.selF);
+  n.edges.material.linewidth = (n.kind === 'value' ? CFG.lineThin : CFG.line) + (CFG.lineSel - CFG.line) * n.selF;
+
+  if (n.label) { const rel = n.S / view.s, hh = Math.min(0.042, Math.max(0.02, 0.2 * rel)) / rel;   // 画面での大きさをほぼ一定に
+    n.label.scale.set(hh * n.label.userData.aspect, hh, 1);
+    show(n.label, sm(0.035, 0.06, a) * (1 - sm(0.45, 0.8, a)) * ctxHi);
+    n.label.material.color.copy(n.baseInk).lerp(ACCENT, n.selF); }
+  if (n.valueSp) show(n.valueSp, sm(0.02, 0.05, a) * (1 - sm(2.5, 5, a)) * ctxHi);
+  if (n.pathLine) show(n.pathLine, sm(0.1, 0.3, a) * (1 - sm(6, 20, a)) * ctxHi * 0.8);
+  if (n.links) for (const l of n.links) show(l, sm(0.25, 0.7, a) * Math.max(0.18, Math.min(1, Math.pow(1.2 / a, 0.4))) * n.ctx * 0.75);
+
+  const panelA = sm(0.04, 0.09, a) * (1 - sm(1.4, 3, a)) * ctxHi;
+  if (panelA > 0.01 && !n.panel) { n.panel = codePanel(n); n.g.add(n.panel); }
+  if (n.panel) show(n.panel, panelA);
+
+  for (const k of n.kids) draw(k);
+}
+
+let last = performance.now(), tickAt = 0, count = 1204118;
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+
+  if (tr) { tr.t += dt; const u = ease(Math.min(1, tr.t / tr.dur));
+    view.s = tr.s0 * Math.pow(tr.s1 / tr.s0, u);
+    const f = tr.s0 === tr.s1 ? u : (tr.s0 - view.s) / (tr.s0 - tr.s1);     // 拡大の中心を動かさない
+    for (let i = 0; i < 3; i++) view.p[i] = tr.p0[i] + (tr.p1[i] - tr.p0[i]) * f;
+    view.dist = tr.d0 + (tr.d1 - tr.d0) * u;
+    if (tr.t >= tr.dur) tr = null; }
+  root.scale.setScalar(1 / view.s);
+  root.position.set(-view.p[0] / view.s, -view.p[1] / view.s, -view.p[2] / view.s);
+
+  mouse.sx += (mouse.x - mouse.sx) * Math.min(1, dt * 4); mouse.sy += (mouse.y - mouse.sy) * Math.min(1, dt * 4);
+  flip += (flipT - flip) * Math.min(1, dt * 5);
+  const fl = Math.sin(flip / 2) ** 2;
+  const yaw = CFG.yaw * (1 - 0.55 * fl) + flip + mouse.sx * 0.13 + Math.sin(now / 5200) * 0.025;
+  const pitch = CFG.pitch * (1 - 0.6 * fl) - mouse.sy * 0.08;
+  cam.position.set(Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)).multiplyScalar(view.dist + (fit(focus, CFG.fitBack) - view.dist) * fl);
+  cam.lookAt(0, 0, 0); cam.updateMatrixWorld();
+
+  if (mouse.moved && !tr && pickList.length) { mouse.moved = false; root.updateMatrixWorld(true);
+    ray.setFromCamera(new THREE.Vector2(mouse.x, mouse.y), cam);
+    const hit = ray.intersectObjects(pickList, false)[0];
+    if (hit) { const i = pickList.indexOf(hit.object); if (i !== focus.sel || !selected) select(i); } }
+
+  for (const n of all) {
+    const ct = n.onChain || n.inSub ? 1 : (n.parent && n.parent.onChain ? 0.3 : 0);
+    n.ctx += (ct - n.ctx) * Math.min(1, dt * 4.5);
+    n.open += ((n.onChain || n === selected ? 1 : 0) - n.open) * Math.min(1, dt * 8);
+    n.selF += ((n === selected ? 1 : 0) - n.selF) * Math.min(1, dt * 10);
+  }
+  draw(tree);
+
+  if (now > tickAt) { tickAt = now + 280; count += 3 + Math.floor(Math.random() * 9);
+    for (const n of all) if (n.tick && n.g.visible) n.valueSp.userData.draw(count.toLocaleString('en-US')); }
+
+  renderer.render(scene, cam);
+  requestAnimationFrame(frame);
+}
+
+resize();
+setFocus(tree); view.p = tree.P.slice(); view.s = tree.S; view.dist = fit(tree); tr = null;
+for (const n of all) { n.ctx = n.onChain || n.inSub ? 1 : 0; }
+window.__nest = { get focus() { return focus.name; }, get busy() { return !!tr; } };
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

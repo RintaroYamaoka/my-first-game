@@ -1,0 +1,5 @@
+# Rust の版を固定する。上げるのは段階の切れ目だけ(Bevy の版と一緒に見直す)
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-gnu"]

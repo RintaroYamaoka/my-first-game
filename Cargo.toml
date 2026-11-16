@@ -1,0 +1,17 @@
+# 実験とゲーム本体を一つの作業場にまとめる。ビルドの成果物(target/)を共有するので、
+# 実験を増やしても Bevy を作り直さずに済む
+[workspace]
+resolver = "3"
+members = ["experiments/01-world-from-code"]
+
+[workspace.dependencies]
+# 版は固定する(docs/decisions/0002)
+bevy = { version = "=0.20.1" }
+
+# 依存する部品は最適化し、自分のコードは速く作り直せるようにする
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
+# 依存する部品にはデバッグ用の情報を付けない(付けると Windows 用の実行ファイルが 2GB を超える)
+debug = false
