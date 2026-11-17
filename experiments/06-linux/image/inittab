@@ -1,0 +1,4 @@
+::sysinit:/etc/game/boot.sh
+ttyS0::respawn:-/bin/bash
+::ctrlaltdel:/sbin/poweroff -f
+::shutdown:/bin/true

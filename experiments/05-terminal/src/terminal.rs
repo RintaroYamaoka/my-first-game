@@ -7,18 +7,24 @@
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty;
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
+use bevy::clipboard::Clipboard;
 use bevy::prelude::*;
 use bevy::text::LineBreak;
 use bevy::window::{CursorGrabMode, CursorOptions};
 use std::borrow::Cow;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -31,6 +37,8 @@ const CH: f32 = 20.0;
 const PAD: f32 = 14.0;
 const BG: [f32; 3] = [0.045, 0.052, 0.068];
 const FG: [f32; 3] = [0.86, 0.88, 0.9];
+const SELECTED: [f32; 3] = [0.22, 0.33, 0.52];
+const MARGIN: f32 = 22.0;
 /// 基本の 16 色
 const PALETTE: [[u8; 3]; 16] = [
     [0x1d, 0x1f, 0x21], [0xe5, 0x43, 0x2a], [0x8c, 0xc8, 0x5f], [0xe6, 0xc3, 0x5c], [0x5f, 0x9f, 0xe6], [0xc0, 0x7a, 0xd8], [0x56, 0xc2, 0xc6], [0xc5, 0xc8, 0xc6],
@@ -56,12 +64,14 @@ impl EventListener for Proxy {
 pub struct Terminal {
     pub open: bool,
     term: Arc<FairMutex<Term<Proxy>>>,
-    tx: EventLoopSender,
+    link: Link,
     rx: Mutex<Receiver<Event>>,
     alive: bool,
     dirty: bool,
     /// 行ごとの、前に描いた内容(変わった行だけ描き直す)
     shown: Vec<Vec<Run>>,
+    /// マウスで選んでいる途中か
+    dragging: bool,
     /// キーを送った時刻(画面に反映されるまでの時間を測る)
     sent_at: Option<Instant>,
     last_ms: f32,
@@ -112,38 +122,142 @@ impl Plugin for TerminalPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(spawn_shell(&self.cwd))
             .add_systems(Startup, setup)
-            .add_systems(Update, (keys, pump, render, auto_type).chain());
+            .add_systems(Update, (keys, mouse, pump, render, auto_type).chain());
     }
+}
+
+/// シェルへの通り道
+enum Link {
+    /// 擬似端末(この PC のシェルを、そのまま動かすとき)
+    Pty(EventLoopSender),
+    /// TCP の接続(同梱の Linux。QEMU の直列の線=シリアルと、じかにつながる)
+    Qemu(TcpStream, Child),
+}
+
+impl Link {
+    fn send(&mut self, bytes: Vec<u8>) {
+        match self {
+            Link::Pty(tx) => {
+                let _ = tx.send(Msg::Input(Cow::Owned(bytes)));
+            }
+            Link::Qemu(stream, _) => {
+                let _ = stream.write_all(&bytes);
+            }
+        }
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        if let Link::Qemu(_, child) = self {
+            let _ = child.kill();
+        }
+    }
+}
+
+/// `--linux <イメージのフォルダ>` が指定されていたら、QEMU を動かすコマンドを返す。
+///   `--accel <tcg|whpx|kvm>`(既定は tcg = どの PC でも動く、遅い方式)、`--qemu <QEMU の場所>`
+/// QEMU の直列の線は、ゲームが待ち受ける TCP の口(port)へつなぐ。
+///   画面入力(標準入力)経由にしない理由: Windows 版の QEMU は、まとめて届いた文字を 8 文字で取りこぼす(2026-11-18 に確認)
+fn linux_command(port: u16) -> Option<Command> {
+    let args: Vec<String> = std::env::args().collect();
+    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned());
+    let image = std::path::PathBuf::from(opt("--linux")?);
+    let accel = opt("--accel").unwrap_or_else(|| "tcg".into());
+    let file = |name: &str| image.join(name).to_string_lossy().to_string();
+    let mut qemu: Vec<String> = Vec::new();
+    let mut add = |items: &[&str]| qemu.extend(items.iter().map(|s| s.to_string()));
+    match accel.as_str() {
+        "tcg" => add(&["-accel", "tcg,thread=multi", "-cpu", "max"]),
+        "kvm" => add(&["-accel", "kvm", "-cpu", "host"]),
+        other => add(&["-accel", other]),
+    }
+    let append = format!("console=ttyS0 quiet rows={LINES} cols={COLS}");
+    add(&["-smp", "2", "-m", "1024", "-append", &append, "-display", "none", "-monitor", "none", "-no-reboot"]);
+    add(&["-serial", &format!("tcp:127.0.0.1:{port},nodelay=on")]);
+    let default_qemu = if cfg!(windows) { "C:\\Program Files\\qemu\\qemu-system-x86_64.exe" } else { "qemu-system-x86_64" };
+    let program = opt("--qemu").unwrap_or_else(|| default_qemu.into());
+    let mut cmd;
+    if cfg!(windows) || Command::new(&program).arg("--version").output().is_ok() {
+        add(&["-kernel", &file("vmlinuz"), "-initrd", &file("initramfs.gz")]);
+        cmd = Command::new(program);
+        cmd.args(qemu);
+    } else {
+        // 開発用: この PC に QEMU がなければ、測定用の Docker イメージの中の QEMU を使う(イメージも、その中のもの)
+        cmd = Command::new("docker");
+        cmd.args(["run", "--rm", "--network", "host"]);
+        if accel == "kvm" {
+            cmd.args(["--device", "/dev/kvm"]);
+        }
+        cmd.args(["my-first-game-linux:bench", "qemu-system-x86_64"]).args(qemu);
+        cmd.args(["-kernel", "/out/vmlinuz", "-initrd", "/out/initramfs.gz"]);
+    }
+    cmd.stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        // QEMU の黒い窓を出さない
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    Some(cmd)
+}
+
+/// 同梱の Linux を起動して、つなぐ。QEMU からの文字は、別のスレッドで読んで、端末のマス目に反映する
+fn spawn_linux(term: &Arc<FairMutex<Term<Proxy>>>, proxy: &Proxy) -> Option<Link> {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("ゲームと Linux の通り道を作れない");
+    let mut cmd = linux_command(listener.local_addr().unwrap().port())?;
+    let child = cmd.spawn().expect("QEMU を起動できない");
+    let (stream, _) = listener.accept().expect("QEMU がつながらない");
+    let _ = stream.set_nodelay(true);
+    let (mut reader, term, proxy) = (stream.try_clone().unwrap(), term.clone(), proxy.clone());
+    std::thread::spawn(move || {
+        let mut parser: Processor = Processor::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    parser.advance(&mut *term.lock(), &buf[..n]);
+                    proxy.send_event(Event::Wakeup);
+                }
+                _ => break,
+            }
+        }
+        proxy.send_event(Event::Exit);
+    });
+    Some(Link::Qemu(stream, child))
 }
 
 /// 本物のシェルを、擬似端末で起動する
 fn spawn_shell(cwd: &std::path::Path) -> Terminal {
     let mut options = tty::Options::default();
     options.env.insert("TERM".into(), "xterm-256color".into());
-    #[cfg(windows)]
-    {
-        // Windows では、まだ同梱の Linux がない(実験 5)。それまでは WSL のシェルを借りる
-        let cmd = std::env::var("SHELL_CMD").unwrap_or_else(|_| "wsl.exe".into());
-        let args = if cmd == "wsl.exe" { vec!["--cd".to_string(), cwd.to_string_lossy().to_string()] } else { vec![] };
-        options.shell = Some(tty::Shell::new(cmd, args));
-    }
-    #[cfg(not(windows))]
-    {
-        let cmd = std::env::var("SHELL_CMD").or_else(|_| std::env::var("SHELL")).unwrap_or_else(|_| "/bin/bash".into());
-        options.shell = Some(tty::Shell::new(cmd, vec![]));
-        options.working_directory = cwd.canonicalize().ok();
-    }
     let size = WindowSize { num_lines: LINES as u16, num_cols: COLS as u16, cell_width: CW as u16, cell_height: CH as u16 };
     let (etx, erx) = channel();
     let proxy = Proxy(etx);
     let term = Arc::new(FairMutex::new(Term::new(Config::default(), &Size, proxy.clone())));
-    let pty = tty::new(&options, size, 0).expect("シェルを起動できない");
-    let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false).expect("端末の読み書きを始められない");
-    let tx = event_loop.channel();
-    event_loop.spawn();
+    let link = spawn_linux(&term, &proxy).unwrap_or_else(|| {
+        #[cfg(windows)]
+        {
+            // 同梱の Linux を指定しないときは、WSL のシェルを借りる
+            let cmd = std::env::var("SHELL_CMD").unwrap_or_else(|_| "wsl.exe".into());
+            let args = if cmd == "wsl.exe" { vec!["--cd".to_string(), cwd.to_string_lossy().to_string()] } else { vec![] };
+            options.shell = Some(tty::Shell::new(cmd, args));
+        }
+        #[cfg(not(windows))]
+        {
+            let cmd = std::env::var("SHELL_CMD").or_else(|_| std::env::var("SHELL")).unwrap_or_else(|_| "/bin/bash".into());
+            options.shell = Some(tty::Shell::new(cmd, vec![]));
+            options.working_directory = cwd.canonicalize().ok();
+        }
+        let pty = tty::new(&options, size, 0).expect("シェルを起動できない");
+        let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false).expect("端末の読み書きを始められない");
+        let tx = event_loop.channel();
+        event_loop.spawn();
+        Link::Pty(tx)
+    });
     Terminal {
-        open: false, term, tx, rx: Mutex::new(erx), alive: true, dirty: true,
-        shown: vec![vec![]; LINES], sent_at: None, last_ms: 0.0, worst_ms: 0.0, fps: 0.0,
+        open: false, term, link, rx: Mutex::new(erx), alive: true, dirty: true,
+        shown: vec![vec![]; LINES], dragging: false, sent_at: None, last_ms: 0.0, worst_ms: 0.0, fps: 0.0,
     }
 }
 
@@ -160,7 +274,7 @@ fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
     let (w, h) = (COLS as f32 * CW, LINES as f32 * CH);
     commands
         .spawn((
-            Node { position_type: PositionType::Absolute, right: px(22), top: px(22), width: px(w + PAD * 2.0), height: px(h + PAD * 2.0 + CH + 6.0), ..default() },
+            Node { position_type: PositionType::Absolute, right: px(MARGIN), top: px(MARGIN), width: px(w + PAD * 2.0), height: px(h + PAD * 2.0 + CH + 6.0), ..default() },
             BackgroundColor(rgb(BG, 0.94)),
             GlobalZIndex(50),
             Visibility::Hidden,
@@ -252,13 +366,83 @@ fn keys(
             t.dirty = true;
             continue;
         }
+        // Ctrl+Shift+C / V は、コピーと貼り付け(mouse で扱う)。Linux へは送らない
+        if ctrl && shift && matches!(ev.key_code, KeyCode::KeyC | KeyCode::KeyV) {
+            continue;
+        }
         let app_cursor = t.term.lock().mode().contains(TermMode::APP_CURSOR);
         if let Some(bytes) = encode(ev, ctrl, alt, app_cursor) {
             t.term.lock().scroll_display(Scroll::Bottom);
-            let _ = t.tx.send(Msg::Input(Cow::Owned(bytes)));
+            t.link.send(bytes);
             t.sent_at.get_or_insert_with(Instant::now);
         }
     }
+}
+
+/// マウスで文字を選ぶ。選び終えると、そのままコピーされる。右クリック(または Ctrl+Shift+V)で貼り付ける
+fn mouse(
+    buttons: Res<ButtonInput<MouseButton>>,
+    held: Res<ButtonInput<KeyCode>>,
+    window: Single<&Window>,
+    mut clipboard: ResMut<Clipboard>,
+    mut t: ResMut<Terminal>,
+) {
+    if !t.open || !t.alive {
+        t.dragging = false;
+        return;
+    }
+    let combo = (held.pressed(KeyCode::ControlLeft) || held.pressed(KeyCode::ControlRight)) && (held.pressed(KeyCode::ShiftLeft) || held.pressed(KeyCode::ShiftRight));
+    // カーソルの下の、マス目の位置
+    let cell = window.cursor_position().map(|c| {
+        let x = (c.x - (window.width() - MARGIN - PAD - COLS as f32 * CW)) / CW;
+        let y = (c.y - MARGIN - PAD) / CH;
+        let inside = x >= 0.0 && y >= 0.0 && x < COLS as f32 && y < LINES as f32;
+        let (col, line) = (x.clamp(0.0, COLS as f32 - 1.0), y.clamp(0.0, LINES as f32 - 1.0));
+        let offset = t.term.lock().grid().display_offset() as i32;
+        let side = if col.fract() < 0.5 { Side::Left } else { Side::Right };
+        (Point::new(Line(line as i32 - offset), Column(col as usize)), side, inside)
+    });
+    if let Some((point, side, inside)) = cell {
+        if buttons.just_pressed(MouseButton::Left) {
+            t.term.lock().selection = inside.then(|| Selection::new(SelectionType::Simple, point, side));
+            t.dragging = inside;
+            t.dirty = true;
+        } else if t.dragging && buttons.pressed(MouseButton::Left) {
+            if let Some(sel) = t.term.lock().selection.as_mut() {
+                sel.update(point, side);
+            }
+            t.dirty = true;
+        }
+    }
+    let copy = (t.dragging && buttons.just_released(MouseButton::Left)) || (combo && held.just_pressed(KeyCode::KeyC));
+    if buttons.just_released(MouseButton::Left) {
+        t.dragging = false;
+    }
+    if copy {
+        if let Some(text) = t.term.lock().selection_to_string().filter(|s| !s.is_empty()) {
+            let _ = clipboard.set_text(text);
+        }
+    }
+    if buttons.just_pressed(MouseButton::Right) || (combo && held.just_pressed(KeyCode::KeyV)) {
+        paste(&mut t, &mut clipboard);
+    }
+}
+
+fn paste(t: &mut Terminal, clipboard: &mut Clipboard) {
+    let got = clipboard.fetch_text().poll_result();
+    let Some(Ok(text)) = got else {
+        eprintln!("paste: クリップボードを読めない: {got:?}");
+        return;
+    };
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    // 貼り付けだと分かる印で囲む(対応しているプログラムは、途中の改行で実行しない)
+    // Windows の擬似端末(ConPTY)経由のときは、印を付けない: 印ごと貼り付けが捨てられる(2026-11-18 に確認)
+    let lossy = cfg!(windows) && matches!(t.link, Link::Pty(_));
+    let bracketed = !lossy && t.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+    eprintln!("paste: {} 文字 (bracketed {bracketed})", text.chars().count());
+    let bytes = if bracketed { format!("\x1b[200~{text}\x1b[201~") } else { text }.into_bytes();
+    t.term.lock().scroll_display(Scroll::Bottom);
+    t.link.send(bytes);
 }
 
 /// 端末からの知らせを受け取る
@@ -269,7 +453,7 @@ fn pump(mut t: ResMut<Terminal>) {
             Event::Wakeup => t.dirty = true,
             // 端末への問い合わせの返事は、シェルへ送り返す
             Event::PtyWrite(s) => {
-                let _ = t.tx.send(Msg::Input(Cow::Owned(s.into_bytes())));
+                t.link.send(s.into_bytes());
             }
             Event::Exit | Event::ChildExit(_) => {
                 t.alive = false;
@@ -307,6 +491,7 @@ fn runs(t: &Terminal) -> (Vec<Vec<Run>>, Option<(usize, usize)>) {
     let term = t.term.lock();
     let content = term.renderable_content();
     let offset = content.display_offset as i32;
+    let selection = content.selection;
     let mut rows: Vec<Vec<Run>> = vec![vec![]; LINES];
     for cell in content.display_iter {
         let line = cell.point.line.0 + offset;
@@ -320,7 +505,7 @@ fn runs(t: &Terminal) -> (Vec<Vec<Run>>, Option<(usize, usize)>) {
         if cell.flags.contains(Flags::DIM) {
             fg = fg.map(|v| v * 0.6);
         }
-        let bg = (bg != BG).then_some(bg);
+        let bg = if selection.is_some_and(|s| s.contains(cell.point)) { Some(SELECTED) } else { (bg != BG).then_some(bg) };
         let ch = if cell.flags.contains(Flags::HIDDEN) { ' ' } else { cell.c };
         if ch == ' ' && bg.is_none() {
             continue;
@@ -359,7 +544,7 @@ fn render(
         return;
     }
     status.0 = format!(
-        "F1 close   key -> screen {:.1} ms (worst {:.1})   {:.0} fps{}",
+        "F1 close   drag: copy   right click: paste   key -> screen {:.1} ms (worst {:.1})   {:.0} fps{}",
         t.last_ms, t.worst_ms, t.fps, if t.alive { "" } else { "   [shell exited]" }
     );
     if !t.dirty {
@@ -402,15 +587,22 @@ fn render(
 }
 
 /// TYPE が指定されていたら、開いて、その文字を打つ(確かめるため)。"\n" は Enter
-fn auto_type(time: Res<Time>, mut t: ResMut<Terminal>, mut done: Local<bool>) {
-    if *done || time.elapsed_secs() < 3.5 {
+fn auto_type(time: Res<Time>, mut t: ResMut<Terminal>, mut done: Local<bool>, mut clipboard: ResMut<Clipboard>) {
+    let at = std::env::var("AT").ok().and_then(|v| v.parse().ok()).unwrap_or(3.5);
+    if *done || time.elapsed_secs() < at {
         return;
     }
     *done = true;
+    if std::env::var("CLIP_TEST").is_ok() {
+        eprintln!("clip test: set {:?}", clipboard.set_text("clip-test"));
+        eprintln!("clip test: get {:?}", clipboard.fetch_text().poll_result());
+        t.open = true;
+        paste(&mut t, &mut clipboard);
+    }
     if let Ok(text) = std::env::var("TYPE") {
         t.open = true;
         t.dirty = true;
-        let _ = t.tx.send(Msg::Input(Cow::Owned(text.replace("\\n", "\r").into_bytes())));
+        t.link.send(text.replace("\\n", "\r").into_bytes());
         t.sent_at = Some(Instant::now());
     }
 }

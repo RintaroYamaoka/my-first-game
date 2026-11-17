@@ -67,3 +67,10 @@ cargo run -p world-from-code                          # WSL の窓で動かす(�
 - **発売する実行ファイルの署名。** 買った人の PC でも同じ保護機能が働くので、段階 6 より前に調査して決める
 - Windows 用のビルドは、今は WSL から作る方式(`x86_64-pc-windows-gnu`)。Steam の部品とつなぐ実験で
   うまくいかなければ、Windows に Microsoft のビルド道具を入れる方式に変える
+
+## 同梱する Linux を組み立てる(実験 5 から)
+
+- **Docker が要る**(`docker` が管理者権限なしで動くこと)。Linux の組み立て(`experiments/06-linux/build.sh`)と、WSL 側での QEMU の測定に使う。
+  QEMU そのものは WSL に入れていない(測定用の Docker イメージの中にある)
+- **Windows で動かすには、Windows 用の QEMU が要る**。本人が入れる: `winget install SoftwareFreedomConservancy.QEMU`
+  (入る場所は `C:\Program Files\qemu\`。ゲームのターミナルは、既定でここを探す)
