@@ -1,0 +1,13 @@
+[package]
+name = "scape"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bevy = { workspace = true }
+oxc_allocator = "0.159.0"
+oxc_ast = "0.159.0"
+oxc_parser = "0.159.0"
+oxc_span = "0.159.0"
+serde_json = "1"
