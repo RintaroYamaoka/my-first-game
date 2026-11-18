@@ -10,6 +10,7 @@
 
 mod analyze;
 mod parse;
+mod sound;
 mod terminal;
 mod world;
 
@@ -181,6 +182,7 @@ fn main() {
             primary_window: Some(Window { title: "terminal".into(), resolution: (1440, 810).into(), ..default() }),
             ..default()
         }))
+        .add_plugins(sound::SoundPlugin)
         .add_plugins(terminal::TerminalPlugin { cwd: std::path::PathBuf::from(&root) })
         .init_gizmo_group::<AccentLines>()
         .insert_resource(ClearColor(Color::BLACK))
@@ -188,7 +190,7 @@ fn main() {
         .insert_resource(Scape(tree))
         .init_resource::<Shown>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (resync.after(terminal::TerminalSystems), control.run_if(|t: Res<terminal::Terminal>| !(t.open && t.focus) && !t.hover), gaze, travel, rebuild, morph, draw, hud, script).chain())
+        .add_systems(Update, (resync.after(terminal::TerminalSystems), control.run_if(|t: Res<terminal::Terminal>| !(t.open && t.focus) && !t.hover), gaze, travel, rebuild, morph, sing, draw, hud, script).chain())
         .run();
 }
 
@@ -201,6 +203,7 @@ fn setup(mut commands: Commands, scape: Res<Scape>, mut gizmo_config: ResMut<Giz
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection { fov: 62f32.to_radians(), near: 0.1, far: 6000.0, ..default() }),
         bevy::core_pipeline::tonemapping::Tonemapping::None,
+        SpatialListener::new(sound::EARS),
         DistanceFog { color: Color::WHITE, falloff: FogFalloff::ExponentialSquared { density: 0.01 }, ..default() },
     ));
     commands.spawn((
@@ -548,6 +551,26 @@ fn morph(time: Res<Time>, scape: Res<Scape>, mut nav: ResMut<Nav>, mut parts: Qu
     }
     if m.t < MORPH_SEC {
         nav.morph = Some(m);
+    }
+}
+
+/// 形の動きに、音を合わせる。伸びる柱は音が上がり、沈む柱は音が下がる。音は、その柱の場所から聞こえる
+fn sing(scape: Res<Scape>, nav: Res<Nav>, mut voices: ResMut<sound::Voices>, mut at: Query<&mut Transform, With<sound::Emitter>>) {
+    let Some(m) = nav.morph.as_ref() else { return };
+    if m.t < 0.0 {
+        return;
+    }
+    let u = ease(m.t / GROW_SEC);
+    // 動いている間は鳴り、止まったら、すっと消える
+    let amp = if m.t < GROW_SEC { 0.5 } else { 0.5 * (1.0 - (m.t - GROW_SEC) / 0.35).max(0.0) };
+    let w = scape.0.n[nav.world].world.as_ref().unwrap();
+    for (j, it) in w.items.iter().enumerate().filter(|(j, _)| fresh(Some(m), *j)).take(3) {
+        // 高い柱ほど、高い音まで上がる
+        let top = 1.0 + (it.dims.y / 30.0).min(1.5);
+        voices.sing(&mut at, eff(Some(m), j, it).0, 130.0 * 2f32.powf(u * top), amp);
+    }
+    for g in 0..m.ghosts.len().min(3) {
+        voices.sing(&mut at, sink(m, g).0, 330.0 * 2f32.powf(-u * 1.6), amp);
     }
 }
 

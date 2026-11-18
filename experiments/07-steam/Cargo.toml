@@ -1,0 +1,10 @@
+[package]
+name = "steam"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bevy = { workspace = true }
+# Steam の機能を Rust から呼ぶ部品(MIT OR Apache-2.0)。Valve の SDK の配布用ファイル(steam_api64.dll)を含む
+steamworks = "=0.13.1"

@@ -81,3 +81,13 @@ TYPE='ls --color\necho 日本語\n' WAIT=4 SHOT=out.png cargo run -p terminal --
 ```sh
 TYPE="rm src/store.ts\n" UNFOCUS=1 AT=9 MORPH=0.6 SHOT=out.png cargo run -p terminal -- experiments/01-world-from-code/sample --linux target/linux-image --accel kvm
 ```
+
+## 音(実験 6、2026-11-18)
+
+柱の動きに、音を合わせた(`src/sound.rs`)。音のファイルは使わず、コードで作る。Bevy 標準の音の機能だけを使っている。
+
+- 声を、起動時に決まった数(6)だけ鳴らしっぱなしにしておく(普段は無音)。ゲームの側は、毎コマ「場所・高さ・大きさ」を書き込むだけ。
+  音を作る側(別のスレッド)が、それを読んで滑らかに追いかける。鳴らすたびに音を用意しないので、出だしが遅れない
+- 伸びる柱は音が上がり、沈む柱は音が下がる。音は、柱のある方向(左右)から聞こえる
+- Bevy 標準の立体的な音は、左右の振り分けだけ(前後・上下の聞き分けはない)
+- 本人が聞いての確認は、まだ(鳴るか、動きとずれないか、雑音がないか)。WSL 側では、落ちないことだけ確かめた
