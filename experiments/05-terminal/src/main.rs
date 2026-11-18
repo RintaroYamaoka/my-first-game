@@ -554,23 +554,37 @@ fn morph(time: Res<Time>, scape: Res<Scape>, mut nav: ResMut<Nav>, mut parts: Qu
     }
 }
 
-/// 形の動きに、音を合わせる。伸びる柱は音が上がり、沈む柱は音が下がる。音は、その柱の場所から聞こえる
-fn sing(scape: Res<Scape>, nav: Res<Nav>, mut voices: ResMut<sound::Voices>, mut at: Query<&mut Transform, With<sound::Emitter>>) {
+/// 形の動きに、音を合わせる。伸びる柱は音が上がり、沈む柱は音が下がる。音は、その柱のある向きから聞こえる。
+/// 世界を渡るときも鳴る(潜るときは下がり、戻るときは上がる)
+fn sing(time: Res<Time>, scape: Res<Scape>, nav: Res<Nav>, mut voices: ResMut<sound::Voices>, mut at: Query<&mut Transform, With<sound::Emitter>>) {
+    let ear = nav.pos;
+    let front = ear + facing(nav.yaw, nav.pitch) * Vec3::NEG_Z;
+    // 起動してすぐに、短い合図を 2 つ鳴らす(音が出る PC かどうかを、すぐ確かめられるように)
+    let t = time.elapsed_secs();
+    if (2.0..2.25).contains(&t) || (2.35..2.7).contains(&t) {
+        voices.sing(&mut at, ear, front, if t < 2.3 { 660.0 } else { 990.0 }, 0.7);
+    }
+    if let Some(tr) = &nav.tr {
+        let down = tr.drop.y > 0.0;
+        let u = if tr.switched { 0.5 + 0.5 * (tr.t / IN_SEC).min(1.0) } else { 0.5 * (tr.t / OUT_SEC).min(1.0) };
+        let freq = if down { 660.0 * 2f32.powf(-u * 1.5) } else { 260.0 * 2f32.powf(u * 1.5) };
+        voices.sing(&mut at, ear, front, freq, 0.6 * (1.0 - u).powf(0.5));
+    }
     let Some(m) = nav.morph.as_ref() else { return };
     if m.t < 0.0 {
         return;
     }
     let u = ease(m.t / GROW_SEC);
     // 動いている間は鳴り、止まったら、すっと消える
-    let amp = if m.t < GROW_SEC { 0.5 } else { 0.5 * (1.0 - (m.t - GROW_SEC) / 0.35).max(0.0) };
+    let amp = if m.t < GROW_SEC { 0.8 } else { 0.8 * (1.0 - (m.t - GROW_SEC) / 0.35).max(0.0) };
     let w = scape.0.n[nav.world].world.as_ref().unwrap();
     for (j, it) in w.items.iter().enumerate().filter(|(j, _)| fresh(Some(m), *j)).take(3) {
         // 高い柱ほど、高い音まで上がる
-        let top = 1.0 + (it.dims.y / 30.0).min(1.5);
-        voices.sing(&mut at, eff(Some(m), j, it).0, 130.0 * 2f32.powf(u * top), amp);
+        let top = 1.0 + (it.dims.y / 30.0).min(1.0);
+        voices.sing(&mut at, ear, eff(Some(m), j, it).0, 330.0 * 2f32.powf(u * top), amp);
     }
     for g in 0..m.ghosts.len().min(3) {
-        voices.sing(&mut at, sink(m, g).0, 330.0 * 2f32.powf(-u * 1.6), amp);
+        voices.sing(&mut at, ear, sink(m, g).0, 880.0 * 2f32.powf(-u * 1.6), amp);
     }
 }
 

@@ -178,6 +178,7 @@ fn linux_command(port: u16, watch_port: u16) -> Option<Command> {
     let image = std::path::PathBuf::from(opt("--linux")?);
     let accel = opt("--accel").unwrap_or_else(|| "tcg".into());
     let file = |name: &str| image.join(name).to_string_lossy().to_string();
+    let on_disk = image.join("root.squashfs").exists();
     let mut qemu: Vec<String> = Vec::new();
     let mut add = |items: &[&str]| qemu.extend(items.iter().map(|s| s.to_string()));
     match accel.as_str() {
@@ -194,6 +195,10 @@ fn linux_command(port: u16, watch_port: u16) -> Option<Command> {
     let mut cmd;
     if cfg!(windows) || Command::new(&program).arg("--version").output().is_ok() {
         add(&["-kernel", &file("vmlinuz"), "-initrd", &file("initramfs.gz")]);
+        // 中身がディスクに置く形(root.squashfs)なら、読み取り専用のディスクとしてつなぐ
+        if on_disk {
+            add(&["-drive", &format!("file={},format=raw,if=virtio,readonly=on", file("root.squashfs"))]);
+        }
         cmd = Command::new(program);
         cmd.args(qemu);
     } else {
@@ -203,8 +208,12 @@ fn linux_command(port: u16, watch_port: u16) -> Option<Command> {
         if accel == "kvm" {
             cmd.args(["--device", "/dev/kvm"]);
         }
-        cmd.args(["my-first-game-linux:bench", "qemu-system-x86_64"]).args(qemu);
-        cmd.args(["-kernel", "/out/vmlinuz", "-initrd", "/out/initramfs.gz"]);
+        let dir = std::fs::canonicalize(&image).unwrap_or(image.clone());
+        cmd.args(["-v", &format!("{}:/d:ro", dir.display()), "my-first-game-linux:bench", "qemu-system-x86_64"]).args(qemu);
+        cmd.args(["-kernel", "/d/vmlinuz", "-initrd", "/d/initramfs.gz"]);
+        if on_disk {
+            cmd.args(["-drive", "file=/d/root.squashfs,format=raw,if=virtio,readonly=on"]);
+        }
     }
     cmd.stdin(Stdio::null());
     #[cfg(windows)]

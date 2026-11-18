@@ -1,0 +1,15 @@
+#!/bin/busybox sh
+# 中身をディスクに置く形の、最初の一歩。小さな initramfs の中で動く。
+# ディスク(読み取り専用、圧縮)を見つけて、その上に「書き込みはメモリへ」の層を重ね、そこへ根を移す
+export PATH=/bin
+busybox mkdir -p /proc /dev /ro /rw /new
+busybox mount -t proc proc /proc
+busybox mount -t devtmpfs dev /dev
+for m in virtio_blk squashfs overlay; do busybox insmod /mod/$m.ko; done
+i=0; while [ ! -b /dev/vda ] && [ $i -lt 100 ]; do busybox sleep 0.02; i=$((i + 1)); done
+busybox mount -t squashfs -o ro /dev/vda /ro
+busybox mount -t tmpfs none /rw
+busybox mkdir /rw/up /rw/work
+busybox mount -t overlay -o lowerdir=/ro,upperdir=/rw/up,workdir=/rw/work none /new
+busybox umount /proc /dev
+exec busybox switch_root /new /init

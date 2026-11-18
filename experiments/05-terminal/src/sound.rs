@@ -83,13 +83,16 @@ pub struct Voices {
 
 impl Voices {
     /// 空いている声を 1 つ使って鳴らす(1 コマぶん。鳴らし続けるなら、毎コマ呼ぶ)
-    pub fn sing(&mut self, tf: &mut Query<&mut Transform, With<Emitter>>, pos: Vec3, freq: f32, amp: f32) {
+    /// `ear` は聞き手(視点)の場所。Bevy 標準の立体的な音は、距離の 2 乗で弱まるので、広い世界では遠くの音が聞こえない。
+    /// そこで、音の出どころは「聞き手から見た向き」だけを使って近くに置き、遠さによる弱まり方は、ここで自分で決める
+    pub fn sing(&mut self, tf: &mut Query<&mut Transform, With<Emitter>>, ear: Vec3, pos: Vec3, freq: f32, amp: f32) {
         let Some((tone, e)) = self.tones.get(self.used) else { return };
         self.used += 1;
+        let far = pos.distance(ear);
         tone.freq.store(freq.to_bits(), Relaxed);
-        tone.amp.store(amp.clamp(0.0, 1.0).to_bits(), Relaxed);
+        tone.amp.store((amp / (1.0 + far / 400.0)).clamp(0.0, 1.0).to_bits(), Relaxed);
         if let Ok(mut t) = tf.get_mut(*e) {
-            t.translation = pos;
+            t.translation = ear + (pos - ear).normalize_or(Vec3::NEG_Z) / SCALE;
         }
     }
 }

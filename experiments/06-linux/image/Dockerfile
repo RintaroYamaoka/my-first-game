@@ -16,7 +16,7 @@ ARG EXTRA=""
 RUN apk add --no-cache bash git nodejs vim nano less inotify-tools ${EXTRA}
 COPY init /init
 COPY inittab /etc/inittab
-COPY boot.sh agent.sh bench.sh bench2.sh bench3.sh bench4.sh runner.mjs /etc/game/
+COPY boot.sh agent.sh bench.sh bench2.sh bench3.sh bench4.sh bench5.sh runner.mjs /etc/game/
 COPY profile.sh /etc/profile.d/game.sh
 RUN chmod +x /init /etc/game/*.sh && rm -rf /var/cache/apk/*
 COPY sample /root/sample
@@ -46,3 +46,16 @@ RUN cd /rootfs && find . -xdev -path ./proc -prune -o -path ./sys -prune -o -pat
 FROM alpine:${ALPINE} AS bench
 RUN apk add --no-cache qemu-system-x86_64 coreutils
 COPY --from=pack /out /out
+
+# 中身をディスクに置く形(メモリに置く形と比べる)
+#   出力: /out/vmlinuz、/out/initramfs.gz(ディスクを見つけて根を移すだけの、小さなもの)、/out/root.squashfs(中身。圧縮、読み取り専用)
+FROM alpine:${ALPINE} AS disk
+RUN apk add --no-cache squashfs-tools cpio busybox-static
+COPY --from=chosen / /rootfs
+COPY --from=kernel /boot/vmlinuz-virt /out/vmlinuz
+COPY --from=kernel /lib/modules /kmod
+COPY init-disk /mini/init
+RUN mksquashfs /rootfs /out/root.squashfs -comp zstd -noappend -quiet \
+ && mkdir -p /mini/bin /mini/mod && cp /bin/busybox.static /mini/bin/busybox && chmod +x /mini/init \
+ && for m in virtio_blk squashfs overlay; do gunzip -c "$(find /kmod -name "$m.ko.gz")" > /mini/mod/$m.ko; done \
+ && cd /mini && find . | cpio -o -H newc --quiet | gzip -9 > /out/initramfs.gz && ls -la /out

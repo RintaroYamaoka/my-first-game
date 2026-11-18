@@ -196,6 +196,24 @@ Windows でも、3 層とも動いた(Windows 用の QEMU 11.1.0、whpx、メモ
 - Docker は大きい(中身が 4 倍)。ゲームが必要とするのが「層に潜る体験」だけなら、もっと小さい道具で足りるかもしれない(未検討)
 - `ssh` で潜る形は、まだ確かめていない
 
+## 中身の置き場所: メモリか、ディスクか(2026-11-18)
+
+本人の決定: 比べて、軽い方を採用する。**結果: ディスクに置く形が軽い。こちらを採用する。** 数字は `docs/decisions/0003` の 4。
+
+```sh
+DISK=1 ./experiments/06-linux/build.sh          # ディスクに置く形も作る(target/linux-image-disk/)
+./experiments/06-linux/compare.py                # メモリとディスクを、測り比べる
+cargo run -p terminal -- experiments/01-world-from-code/sample --linux target/linux-image-disk --accel kvm
+```
+
+| ファイル | 役目 |
+|---|---|
+| `root.squashfs` | 中身。圧縮した、読み取り専用のディスク。使うところだけ読まれる |
+| `initramfs.gz`(0.8 MB) | 小さな入口。ディスクを見つけ、その上に「書き込みはメモリへ」の層を重ねて、根を移す(`image/init-disk`) |
+
+ゲームのターミナルは、`--linux` のフォルダに `root.squashfs` があれば、ディスクとしてつなぐ。
+ファイルの変化を世界へ知らせる仕組みも、そのまま動いた(WSL の窓で確認)。
+
 ## まだ確かめていないこと
 
 - 仮想化の機能がオフの PC での振る舞い(自動で遅い方式に切り替える、案内を出す、など)

@@ -18,7 +18,7 @@ Steam を起動して、ログインした状態で:
 
 ```sh
 cargo build -p steam --target x86_64-pc-windows-gnu
-# steam.exe の隣に steam_api64.dll を置いてから起動する(手順は下)
+# steam.exe と steam_api64.dll を Windows 側の同じフォルダに置いて、steam.exe を起動する
 ```
 
 **起動中は、Steam の上で「Spacewar をプレイ中」と表示される(フレンドにも見える)。**
@@ -32,7 +32,11 @@ cargo build -p steam --target x86_64-pc-windows-gnu
 ## 分かったこと
 
 - Windows 用にビルドできた(`x86_64-pc-windows-gnu`)。
-- 実際に Steam につないでの確認は、本人の了解を得てから行う(アカウントの表示に出るため)。
+- **Steam につながった**(2026-11-18、本人の了解を得て、Windows で起動)。自動で読んだ状態:
+  つながった / ログイン中 / オーバーレイは有効 / 実績の状態を読めた(未解除)。
+- オーバーレイが実際に画面に出るか: 本人が操作して「出来た 多分」(2026-11-18)。はっきりした確認ではないので、段階 2 で自分のアプリの番号を取ったあとに、もう一度確かめる。
+- 実績の解除の通知は、試していない。
+- `steam.exe` の隣に `steam_api64.dll` を置く必要がある(`steamworks-sys` の中の `lib/steam/redistributable_bin/win64/`)。
 
 ## 守ること
 

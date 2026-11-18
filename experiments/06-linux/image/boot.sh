@@ -12,4 +12,5 @@ case "$(arg bench)" in
   2) /etc/game/bench2.sh > /dev/ttyS0 2>&1; poweroff -f ;;
   3) /etc/game/bench3.sh > /dev/ttyS0 2>&1; poweroff -f ;;
   4) /etc/game/bench4.sh > /dev/ttyS0 2>&1; poweroff -f ;;
+  5) /etc/game/bench5.sh > /dev/ttyS0 2>&1; poweroff -f ;;
 esac
