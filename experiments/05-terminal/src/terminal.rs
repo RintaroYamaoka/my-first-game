@@ -25,6 +25,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -39,6 +40,8 @@ const BG: [f32; 3] = [0.045, 0.052, 0.068];
 const FG: [f32; 3] = [0.86, 0.88, 0.9];
 const SELECTED: [f32; 3] = [0.22, 0.33, 0.52];
 const MARGIN: f32 = 22.0;
+/// パネルが画面の右から占める幅(世界の側が、空いている場所を知るため)
+pub const PANEL_W: f32 = COLS as f32 * CW + PAD * 2.0 + MARGIN;
 /// 基本の 16 色
 const PALETTE: [[u8; 3]; 16] = [
     [0x1d, 0x1f, 0x21], [0xe5, 0x43, 0x2a], [0x8c, 0xc8, 0x5f], [0xe6, 0xc3, 0x5c], [0x5f, 0x9f, 0xe6], [0xc0, 0x7a, 0xd8], [0x56, 0xc2, 0xc6], [0xc5, 0xc8, 0xc6],
@@ -63,8 +66,14 @@ impl EventListener for Proxy {
 #[derive(Resource)]
 pub struct Terminal {
     pub open: bool,
+    /// キー入力の行き先がターミナルか(開いていても、外をクリックすると世界の操作に戻る)
+    pub focus: bool,
+    /// マウスが、ターミナルの上にあるか(つかんでいないとき)
+    pub hover: bool,
     term: Arc<FairMutex<Term<Proxy>>>,
     link: Link,
+    /// 同梱の Linux の中のファイルの写し(この PC の上)と、変化の回数。世界は、これを見て作り直す
+    pub mirror: Option<(PathBuf, Arc<AtomicU64>)>,
     rx: Mutex<Receiver<Event>>,
     alive: bool,
     dirty: bool,
@@ -114,6 +123,10 @@ struct Run {
     bg: Option<[f32; 3]>,
 }
 
+/// ターミナルの処理のまとまり。世界の操作は、この後に動かす(同じクリックを、両方が受け取らないように)
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TerminalSystems;
+
 pub struct TerminalPlugin {
     pub cwd: PathBuf,
 }
@@ -122,7 +135,7 @@ impl Plugin for TerminalPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(spawn_shell(&self.cwd))
             .add_systems(Startup, setup)
-            .add_systems(Update, (keys, mouse, pump, render, auto_type).chain());
+            .add_systems(Update, (keys, mouse, pump, render, auto_type).chain().in_set(TerminalSystems));
     }
 }
 
@@ -159,7 +172,7 @@ impl Drop for Link {
 ///   `--accel <tcg|whpx|kvm>`(既定は tcg = どの PC でも動く、遅い方式)、`--qemu <QEMU の場所>`
 /// QEMU の直列の線は、ゲームが待ち受ける TCP の口(port)へつなぐ。
 ///   画面入力(標準入力)経由にしない理由: Windows 版の QEMU は、まとめて届いた文字を 8 文字で取りこぼす(2026-11-18 に確認)
-fn linux_command(port: u16) -> Option<Command> {
+fn linux_command(port: u16, watch_port: u16) -> Option<Command> {
     let args: Vec<String> = std::env::args().collect();
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned());
     let image = std::path::PathBuf::from(opt("--linux")?);
@@ -174,7 +187,8 @@ fn linux_command(port: u16) -> Option<Command> {
     }
     let append = format!("console=ttyS0 quiet rows={LINES} cols={COLS}");
     add(&["-smp", "2", "-m", "1024", "-append", &append, "-display", "none", "-monitor", "none", "-no-reboot"]);
-    add(&["-serial", &format!("tcp:127.0.0.1:{port},nodelay=on")]);
+    // 1 本目: ターミナル。2 本目: ファイルの変化の知らせ
+    add(&["-serial", &format!("tcp:127.0.0.1:{port},nodelay=on"), "-serial", &format!("tcp:127.0.0.1:{watch_port},nodelay=on")]);
     let default_qemu = if cfg!(windows) { "C:\\Program Files\\qemu\\qemu-system-x86_64.exe" } else { "qemu-system-x86_64" };
     let program = opt("--qemu").unwrap_or_else(|| default_qemu.into());
     let mut cmd;
@@ -203,11 +217,21 @@ fn linux_command(port: u16) -> Option<Command> {
 }
 
 /// 同梱の Linux を起動して、つなぐ。QEMU からの文字は、別のスレッドで読んで、端末のマス目に反映する
-fn spawn_linux(term: &Arc<FairMutex<Term<Proxy>>>, proxy: &Proxy) -> Option<Link> {
+fn spawn_linux(term: &Arc<FairMutex<Term<Proxy>>>, proxy: &Proxy) -> Option<(Link, (PathBuf, Arc<AtomicU64>))> {
     let listener = TcpListener::bind("127.0.0.1:0").expect("ゲームと Linux の通り道を作れない");
-    let mut cmd = linux_command(listener.local_addr().unwrap().port())?;
+    let watch = TcpListener::bind("127.0.0.1:0").expect("ゲームと Linux の通り道を作れない");
+    let mut cmd = linux_command(listener.local_addr().unwrap().port(), watch.local_addr().unwrap().port())?;
     let child = cmd.spawn().expect("QEMU を起動できない");
     let (stream, _) = listener.accept().expect("QEMU がつながらない");
+    let (watch_stream, _) = watch.accept().expect("QEMU がつながらない");
+    let mirror = std::env::temp_dir().join(format!("my-first-game-{}", std::process::id())).join("sample");
+    let _ = std::fs::remove_dir_all(&mirror);
+    std::fs::create_dir_all(&mirror).expect("写しを置く場所を作れない");
+    let changes = Arc::new(AtomicU64::new(0));
+    {
+        let (mirror, changes) = (mirror.clone(), changes.clone());
+        std::thread::spawn(move || watch_files(watch_stream, &mirror, &changes));
+    }
     let _ = stream.set_nodelay(true);
     let (mut reader, term, proxy) = (stream.try_clone().unwrap(), term.clone(), proxy.clone());
     std::thread::spawn(move || {
@@ -224,7 +248,56 @@ fn spawn_linux(term: &Arc<FairMutex<Term<Proxy>>>, proxy: &Proxy) -> Option<Link
         }
         proxy.send_event(Event::Exit);
     });
-    Some(Link::Qemu(stream, child))
+    Some((Link::Qemu(stream, child), (mirror, changes)))
+}
+
+/// 見張り番(Linux の中の agent.sh)からの知らせを読んで、この PC の上の写しに反映する
+fn watch_files(stream: TcpStream, mirror: &std::path::Path, changes: &AtomicU64) {
+    use std::io::BufRead;
+    // 写しの外へ出る道筋は受け付けない
+    let safe = |rel: &str| (!rel.is_empty() && !rel.starts_with('/') && !rel.split('/').any(|p| p == ".." || p.is_empty())).then(|| mirror.join(rel));
+    for line in std::io::BufReader::new(stream).lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim_end_matches('\r');
+        if line == "S" {
+            changes.fetch_add(1, Ordering::Relaxed);
+        } else if let Some(rest) = line.strip_prefix("F ") {
+            let Some((b64, rel)) = rest.split_once(' ') else { continue };
+            let Some(path) = safe(rel) else { continue };
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, if b64 == "-" { vec![] } else { base64(b64) });
+        } else if let Some(rel) = line.strip_prefix("D ") {
+            let Some(path) = safe(rel) else { continue };
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(path);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+fn base64(text: &str) -> Vec<u8> {
+    let (mut out, mut acc, mut bits) = (Vec::with_capacity(text.len() * 3 / 4), 0u32, 0);
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
 }
 
 /// 本物のシェルを、擬似端末で起動する
@@ -235,7 +308,12 @@ fn spawn_shell(cwd: &std::path::Path) -> Terminal {
     let (etx, erx) = channel();
     let proxy = Proxy(etx);
     let term = Arc::new(FairMutex::new(Term::new(Config::default(), &Size, proxy.clone())));
-    let link = spawn_linux(&term, &proxy).unwrap_or_else(|| {
+    let linux = spawn_linux(&term, &proxy);
+    let (linux_link, mirror) = match linux {
+        Some((l, m)) => (Some(l), Some(m)),
+        None => (None, None),
+    };
+    let link = linux_link.unwrap_or_else(|| {
         #[cfg(windows)]
         {
             // 同梱の Linux を指定しないときは、WSL のシェルを借りる
@@ -256,7 +334,7 @@ fn spawn_shell(cwd: &std::path::Path) -> Terminal {
         Link::Pty(tx)
     });
     Terminal {
-        open: false, term, link, rx: Mutex::new(erx), alive: true, dirty: true,
+        open: false, focus: false, hover: false, term, link, mirror, rx: Mutex::new(erx), alive: true, dirty: true,
         shown: vec![vec![]; LINES], dragging: false, sent_at: None, last_ms: 0.0, worst_ms: 0.0, fps: 0.0,
     }
 }
@@ -346,9 +424,11 @@ fn keys(
         if ev.state != ButtonState::Pressed {
             continue;
         }
-        let toggle = ev.key_code == KeyCode::F1 || (!t.open && ev.key_code == KeyCode::KeyT);
-        if toggle && !ev.repeat {
-            t.open = !t.open;
+        // F1: 開く・閉じる。T: 開く、または(開いていて世界を操作中なら)ターミナルへ戻る
+        let back = ev.key_code == KeyCode::KeyT && !(t.open && t.focus);
+        if (ev.key_code == KeyCode::F1 || back) && !ev.repeat {
+            t.open = back || !t.open;
+            t.focus = t.open;
             t.dirty = true;
             if t.open {
                 // 開いている間は、マウスを放す
@@ -357,7 +437,7 @@ fn keys(
             }
             continue;
         }
-        if !t.open || !t.alive {
+        if !t.open || !t.focus || !t.alive {
             continue;
         }
         // Shift + PageUp / PageDown: 過去の出力へ戻る
@@ -384,10 +464,28 @@ fn mouse(
     buttons: Res<ButtonInput<MouseButton>>,
     held: Res<ButtonInput<KeyCode>>,
     window: Single<&Window>,
+    mut grab: Single<&mut CursorOptions>,
     mut clipboard: ResMut<Clipboard>,
     mut t: ResMut<Terminal>,
 ) {
-    if !t.open || !t.alive {
+    // マウスが、ターミナルの上にあるか(世界の操作でマウスをつかんでいる間は、数えない)
+    let free = grab.grab_mode == CursorGrabMode::None;
+    let (w, h) = (COLS as f32 * CW + PAD * 2.0, LINES as f32 * CH + PAD * 2.0 + CH + 6.0);
+    t.hover = t.open && free && window.cursor_position().is_some_and(|c| {
+        let x = c.x - (window.width() - MARGIN - w);
+        x >= 0.0 && x <= w && c.y >= MARGIN && c.y <= MARGIN + h
+    });
+    if buttons.just_pressed(MouseButton::Left) && t.open && free && t.hover != t.focus {
+        // 上をクリック: ターミナルへ。外をクリック: 世界の操作へ(ターミナルは開いたまま)
+        t.focus = t.hover;
+        t.dragging = false;
+        t.dirty = true;
+        if t.focus {
+            grab.visible = true;
+        }
+        return;
+    }
+    if !t.open || !t.focus || !t.alive {
         t.dragging = false;
         return;
     }
@@ -532,21 +630,27 @@ fn render(
     mut commands: Commands,
     time: Res<Time>,
     mut t: ResMut<Terminal>,
-    mut panel: Single<&mut Visibility, With<Panel>>,
+    mut panel: Single<(&mut Visibility, &mut BackgroundColor), With<Panel>>,
     rows: Query<(Entity, &Row)>,
     mut cursor: Single<&mut Node, With<CursorBlock>>,
     mut status: Single<&mut Text, With<Status>>,
     glyphs: Res<Glyphs>,
 ) {
     t.fps += (1.0 / time.delta_secs().max(1e-4) - t.fps) * 0.05;
-    **panel = if t.open { Visibility::Visible } else { Visibility::Hidden };
+    *panel.0 = if t.open { Visibility::Visible } else { Visibility::Hidden };
+    // 世界を操作している間は、ターミナルを薄くして、後ろの世界を見やすくする
+    panel.1.0 = rgb(BG, if t.focus { 0.94 } else { 0.45 });
     if !t.open {
         return;
     }
-    status.0 = format!(
-        "F1 close   drag: copy   right click: paste   key -> screen {:.1} ms (worst {:.1})   {:.0} fps{}",
-        t.last_ms, t.worst_ms, t.fps, if t.alive { "" } else { "   [shell exited]" }
-    );
+    status.0 = if t.focus {
+        format!(
+            "F1 close   click outside: world   drag: copy   right click: paste   key -> screen {:.1} ms (worst {:.1})   {:.0} fps{}",
+            t.last_ms, t.worst_ms, t.fps, if t.alive { "" } else { "   [shell exited]" }
+        )
+    } else {
+        "[ world ]   T or click here (after Esc): back to terminal   F1 close".to_string()
+    };
     if !t.dirty {
         return;
     }
@@ -597,10 +701,12 @@ fn auto_type(time: Res<Time>, mut t: ResMut<Terminal>, mut done: Local<bool>, mu
         eprintln!("clip test: set {:?}", clipboard.set_text("clip-test"));
         eprintln!("clip test: get {:?}", clipboard.fetch_text().poll_result());
         t.open = true;
+        t.focus = true;
         paste(&mut t, &mut clipboard);
     }
     if let Ok(text) = std::env::var("TYPE") {
         t.open = true;
+        t.focus = std::env::var("UNFOCUS").is_err();
         t.dirty = true;
         t.link.send(text.replace("\\n", "\r").into_bytes());
         t.sent_at = Some(Instant::now());

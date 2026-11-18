@@ -77,6 +77,80 @@ struct Nav {
     veil: f32,
     rebuild: bool,
     changed: bool,
+    /// ファイルが変わって世界を作り直したときの、形の動き
+    morph: Option<Morph>,
+    /// 変化が起きた場所へ、視線を自動で向ける(見る先、経った時間)
+    gaze: Option<(Vec3, f32)>,
+    /// 見る先まで、あとどれだけ向きが残っているか(ラジアン)
+    gaze_left: f32,
+}
+
+const GAZE_SEC: f32 = 1.4;
+
+/// 作り直す前の姿から、今の姿へ動かす。新しい形は足元から伸び、消えた形は足元へ沈む
+struct Morph {
+    t: f32,
+    /// 今の世界の形ごとの、前の姿(位置、大きさ)。なければ、新しくできた形
+    from: Vec<Option<(Vec3, Vec3)>>,
+    /// 消えた形(位置、大きさ、向き、面を持つか)
+    ghosts: Vec<(Vec3, Vec3, f32, bool)>,
+}
+
+const GROW_SEC: f32 = 1.3;
+/// 伸びきったあとも、少しの間だけ色を残す
+const MORPH_SEC: f32 = 2.2;
+/// 視線が向き終わってから、ひと呼吸おいて動かし始める
+const MORPH_LEAD: f32 = 0.2;
+/// ここまで向いたら、向き終わったとみなす(ラジアン)
+const GAZE_DONE: f32 = 0.03;
+
+/// ゆっくり始まり、ゆっくり終わる
+fn ease(u: f32) -> f32 {
+    let u = u.clamp(0.0, 1.0);
+    u * u * (3.0 - 2.0 * u)
+}
+
+/// 動いている途中の、形の位置と大きさ
+fn eff(m: Option<&Morph>, j: usize, it: &world::Item) -> (Vec3, Vec3) {
+    let Some(m) = m else { return (it.pos, it.dims) };
+    let u = ease(m.t / GROW_SEC);
+    let (p0, d0) = m.from.get(j).copied().flatten().unwrap_or((it.pos - Vec3::Y * it.dims.y * 0.5, Vec3::new(it.dims.x, 0.0, it.dims.z)));
+    (p0.lerp(it.pos, u), d0.lerp(it.dims, u))
+}
+
+/// 消えていく形の、位置と大きさ
+fn sink(m: &Morph, g: usize) -> (Vec3, Vec3) {
+    let (pos, dims, ..) = m.ghosts[g];
+    let u = ease(m.t / GROW_SEC);
+    (pos - Vec3::Y * dims.y * 0.5 * u, Vec3::new(dims.x, dims.y * (1.0 - u), dims.z))
+}
+
+fn fresh(m: Option<&Morph>, j: usize) -> bool {
+    m.is_some_and(|m| m.from.get(j).is_some_and(|f| f.is_none()))
+}
+
+/// もとの大きさに対する、今の大きさの割合
+fn ratio(now: Vec3, full: Vec3) -> Vec3 {
+    Vec3::select(full.cmpgt(Vec3::splat(1e-4)), now / full, Vec3::ONE)
+}
+
+#[derive(Clone, Copy)]
+enum Src {
+    Item(usize),
+    Ghost(usize),
+}
+
+/// 形を作る箱ひとつ(どの形の、どの部分か)
+#[derive(Component)]
+struct Part {
+    src: Src,
+    off: Vec3,
+    dims: Vec3,
+}
+
+fn part_tf(pos: Vec3, r: Vec3, yaw: f32, off: Vec3, dims: Vec3) -> Transform {
+    let rot = Quat::from_rotation_y(yaw);
+    Transform { translation: pos + rot * (off * r), rotation: rot, scale: (dims * r).max(Vec3::splat(0.001)) }
 }
 
 #[derive(Resource, Default)]
@@ -114,7 +188,7 @@ fn main() {
         .insert_resource(Scape(tree))
         .init_resource::<Shown>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (control.run_if(|t: Res<terminal::Terminal>| !t.open), travel, rebuild, draw, hud, script).chain())
+        .add_systems(Update, (resync.after(terminal::TerminalSystems), control.run_if(|t: Res<terminal::Terminal>| !(t.open && t.focus) && !t.hover), gaze, travel, rebuild, morph, draw, hud, script).chain())
         .run();
 }
 
@@ -150,7 +224,68 @@ fn setup(mut commands: Commands, scape: Res<Scape>, mut gizmo_config: ResMut<Giz
     ));
 
     let w = scape.0.n[0].world.as_ref().expect("世界がない");
-    commands.insert_resource(Nav { world: 0, pos: w.spawn, yaw: w.yaw, pitch: w.pitch, aim: None, tr: None, veil: 0.0, rebuild: true, changed: true });
+    commands.insert_resource(Nav { world: 0, pos: w.spawn, yaw: w.yaw, pitch: w.pitch, aim: None, tr: None, veil: 0.0, rebuild: true, changed: true, morph: None, gaze: None, gaze_left: 0.0 });
+}
+
+/// 同梱の Linux の中でファイルが変わったら、その写しから世界を作り直す(見張り番からの知らせが、少し落ち着いてから)
+fn resync(time: Res<Time>, term: Res<terminal::Terminal>, mut scape: ResMut<Scape>, mut nav: ResMut<Nav>, mut seen: Local<u64>, mut quiet: Local<f32>, mut synced: Local<bool>) {
+    let Some((mirror, changes)) = &term.mirror else { return };
+    let now = changes.load(std::sync::atomic::Ordering::Relaxed);
+    if now == *seen {
+        return;
+    }
+    *quiet += time.delta_secs();
+    if *quiet < 0.15 || nav.tr.is_some() {
+        return;
+    }
+    (*seen, *quiet) = (now, 0.0);
+    let new = world::build(mirror);
+    // 今いる世界を、名前でたどり直す。なくなっていたら、たどれたところまで戻る
+    let names: Vec<String> = scape.0.chain(nav.world).iter().skip(1).map(|&i| scape.0.n[i].name.clone()).collect();
+    let (mut at, mut followed) = (0, 0);
+    for name in &names {
+        let next = new.n[at].world.as_ref().and_then(|w| w.items.iter().map(|it| it.node).find(|&k| &new.n[k].name == name && new.n[k].world.is_some()));
+        match next {
+            Some(k) => (at, followed) = (k, followed + 1),
+            None => break,
+        }
+    }
+    if followed < names.len() {
+        let w = new.n[at].world.as_ref().unwrap();
+        (nav.pos, nav.yaw, nav.pitch) = (w.spawn, w.yaw, w.pitch);
+    }
+    // 同じ世界に居続けるなら、前の姿から今の姿へ動かす(名前で対応づける)
+    nav.morph = None;
+    // 起動してすぐの最初の同期は、動かさない(手元の写しと、Linux の中身の違いを合わせるだけ)
+    if followed == names.len() && std::mem::replace(&mut *synced, true) {
+        let old = &scape.0;
+        let (ow, nw) = (old.n[nav.world].world.as_ref().unwrap(), new.n[at].world.as_ref().unwrap());
+        let mut before: std::collections::HashMap<&str, std::collections::VecDeque<usize>> = Default::default();
+        for (j, it) in ow.items.iter().enumerate() {
+            before.entry(old.n[it.node].name.as_str()).or_default().push_back(j);
+        }
+        let from: Vec<_> = nw.items.iter().map(|it| {
+            let j = before.get_mut(new.n[it.node].name.as_str()).and_then(|q| q.pop_front())?;
+            Some((ow.items[j].pos, ow.items[j].dims))
+        }).collect();
+        let ghosts: Vec<_> = before.values().flatten().map(|&j| { let it = &ow.items[j]; (it.pos, it.dims, it.yaw, it.solid) }).collect();
+        let moved = from.iter().zip(&nw.items).any(|(f, it)| f.is_none_or(|(p, d)| p != it.pos || d != it.dims));
+        // 見る先: 新しくできた形。なければ消えた形。なければ大きさが変わった形
+        let mean = |v: Vec<Vec3>| (!v.is_empty()).then(|| v.iter().sum::<Vec3>() / v.len() as f32);
+        let born = mean(from.iter().zip(&nw.items).filter(|(f, _)| f.is_none()).map(|(_, it)| it.pos).collect());
+        let gone = mean(ghosts.iter().map(|g| g.0).collect());
+        let resized = mean(from.iter().zip(&nw.items).filter(|(f, it)| f.is_some_and(|(_, d)| d != it.dims)).map(|(_, it)| it.pos).collect());
+        nav.gaze = born.or(gone).or(resized).map(|p| (p, 0.0));
+        nav.gaze_left = std::f32::consts::PI;
+        if moved || !ghosts.is_empty() {
+            nav.morph = Some(Morph { t: -MORPH_LEAD, from, ghosts });
+        }
+    }
+    nav.world = at;
+    nav.aim = None;
+    nav.rebuild = true;
+    nav.changed = true;
+    scape.0 = new;
 }
 
 fn dive(tree: &Tree, nav: &mut Nav, item: usize) {
@@ -215,6 +350,9 @@ fn control(
         return;
     }
     if grabbed {
+        if motion.delta != Vec2::ZERO {
+            nav.gaze = None;
+        }
         nav.yaw -= motion.delta.x * SENS;
         nav.pitch = (nav.pitch - motion.delta.y * SENS).clamp(-1.54, 1.54);
     }
@@ -258,6 +396,31 @@ fn control(
     }
 }
 
+/// 変化が起きた場所へ、視線を滑らかに向ける。ターミナルが開いていれば、その左の空いている場所に見えるように向ける
+fn gaze(time: Res<Time>, term: Res<terminal::Terminal>, window: Single<&Window>, proj: Single<&Projection, With<Camera3d>>, mut nav: ResMut<Nav>) {
+    let Some((target, mut t)) = nav.gaze.take() else { return };
+    let dt = time.delta_secs().min(0.05);
+    t += dt;
+    let (mut yaw, pitch) = world::look(nav.pos, target);
+    if term.open {
+        let Projection::Perspective(p) = *proj else { return };
+        let (w, h) = (window.width(), window.height());
+        let free = (w - terminal::PANEL_W).max(0.0);
+        // 画面の中心から、空いている場所の中心までのずれ(左が正)を、角度に直す
+        let shift = (w * 0.5 - free * 0.5) / (h * 0.5) * (p.fov * 0.5).tan();
+        yaw -= shift.atan();
+    }
+    let turn = (yaw - nav.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    let k = 1.0 - (-dt * 7.0).exp();
+    let tilt = pitch.clamp(-1.54, 1.54) - nav.pitch;
+    nav.yaw += turn * k;
+    nav.pitch += tilt * k;
+    nav.gaze_left = (turn.abs() + tilt.abs()) * (1.0 - k);
+    if t < GAZE_SEC {
+        nav.gaze = Some((target, t));
+    }
+}
+
 fn travel(time: Res<Time>, mut nav: ResMut<Nav>, mut cam: Single<&mut Transform, With<Camera3d>>) {
     let dt = time.delta_secs().min(0.05);
     if let Some(mut tr) = nav.tr.take() {
@@ -274,6 +437,8 @@ fn travel(time: Res<Time>, mut nav: ResMut<Nav>, mut cam: Single<&mut Transform,
                 nav.aim = None;
                 nav.rebuild = true;
                 nav.changed = true;
+                nav.morph = None;
+                nav.gaze = None;
             }
             nav.tr = Some(tr);
         } else {
@@ -327,13 +492,21 @@ fn rebuild(
         let tf = Transform { translation: pos, rotation: Quat::from_rotation_y(yaw), scale: dims };
         shown.slabs.push(commands.spawn((Mesh3d(cube.clone()), MeshMaterial3d(mat.clone()), tf)).id());
     }
-    for it in &w.items {
-        let rot = Quat::from_rotation_y(it.yaw);
+    let m = nav.morph.as_ref();
+    for (g, &(pos, dims, yaw, solid)) in m.iter().flat_map(|m| m.ghosts.iter().enumerate()) {
+        if solid {
+            let tf = part_tf(pos, Vec3::ONE, yaw, Vec3::ZERO, dims);
+            shown.slabs.push(commands.spawn((Mesh3d(cube.clone()), MeshMaterial3d(mat.clone()), tf, Part { src: Src::Ghost(g), off: Vec3::ZERO, dims })).id());
+        }
+    }
+    for (j, it) in w.items.iter().enumerate() {
+        let (pos, now) = eff(m, j, it);
+        let r = ratio(now, it.dims);
         let whole = [(Vec3::ZERO, it.dims)];
         for &(off, dims) in if it.parts.is_empty() { &whole[..] } else { &it.parts[..] } {
             if it.solid {
-                let tf = Transform { translation: it.pos + rot * off, rotation: rot, scale: dims };
-                shown.slabs.push(commands.spawn((Mesh3d(cube.clone()), MeshMaterial3d(mat.clone()), tf)).id());
+                let tf = part_tf(pos, r, it.yaw, off, dims);
+                shown.slabs.push(commands.spawn((Mesh3d(cube.clone()), MeshMaterial3d(mat.clone()), tf, Part { src: Src::Item(j), off, dims })).id());
             }
         }
         shown.labels.push(commands.spawn((
@@ -344,6 +517,37 @@ fn rebuild(
             Visibility::Hidden,
             Label,
         )).id());
+    }
+}
+
+/// 作り直した直後の、形の動きを進める
+fn morph(time: Res<Time>, scape: Res<Scape>, mut nav: ResMut<Nav>, mut parts: Query<(&Part, &mut Transform, &mut Visibility)>) {
+    let Some(mut m) = nav.morph.take() else { return };
+    // 視線が向き終わるまでは、動かし始めない
+    let turning = nav.gaze.is_some() && nav.gaze_left > GAZE_DONE;
+    if !(turning && m.t <= -MORPH_LEAD) {
+        m.t += time.delta_secs().min(0.05);
+    }
+    let w = scape.0.n[nav.world].world.as_ref().unwrap();
+    for (part, mut tf, mut vis) in &mut parts {
+        match part.src {
+            Src::Item(j) => {
+                let Some(it) = w.items.get(j) else { continue };
+                let (pos, now) = eff(Some(&m), j, it);
+                *tf = part_tf(pos, ratio(now, it.dims), it.yaw, part.off, part.dims);
+            }
+            Src::Ghost(g) => {
+                let (pos, now) = sink(&m, g);
+                let (_, dims, yaw, _) = m.ghosts[g];
+                *tf = part_tf(pos, ratio(now, dims), yaw, part.off, part.dims);
+                if m.t >= GROW_SEC {
+                    *vis = Visibility::Hidden;
+                }
+            }
+        }
+    }
+    if m.t < MORPH_SEC {
+        nav.morph = Some(m);
     }
 }
 
@@ -372,34 +576,61 @@ fn draw(
         1.0 - (1.0 - (-d * d).exp()).min(FOG_CAP)
     };
 
+    let m = nav.morph.as_ref();
+    // 消えていく形: 枠だけが、足元へ沈みながら薄れる
+    for g in 0..m.map_or(0, |m| m.ghosts.len()) {
+        let m = m.unwrap();
+        let ((pos, dims), rot) = (sink(m, g), Quat::from_rotation_y(m.ghosts[g].2));
+        let h = dims * 0.5;
+        let alpha = 1.0 - (m.t / GROW_SEC).clamp(0.0, 1.0);
+        let loop_at = |y: f32| [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0)].map(|(sx, sz)| pos + rot * Vec3::new(h.x * sx, y, h.z * sz));
+        let (hi, lo) = (loop_at(h.y), loop_at(-h.y));
+        for c in 0..4 {
+            for (a, b) in [(hi[c], hi[c + 1]), (lo[c], lo[c + 1]), (hi[c], lo[c])] {
+                edge(&mut accent, a, b, ACCENT, alpha, eye, density * 0.4);
+            }
+        }
+    }
     for (j, it) in w.items.iter().enumerate() {
         let rot = Quat::from_rotation_y(it.yaw);
+        // 新しくできた形は、伸びている間、目立つ色の枠になる
+        let glow = if fresh(m, j) { 1.0 - ((m.unwrap().t - GROW_SEC) / (MORPH_SEC - GROW_SEC)).clamp(0.0, 1.0) } else { 0.0 };
         let aimed = nav.aim == Some(j);
-        let half = it.dims * 0.5;
-        let at = |x: f32, y: f32, z: f32| it.pos + rot * Vec3::new(x, y, z);
+        let (it_pos, it_dims) = eff(m, j, it);
+        let r = ratio(it_dims, it.dims);
+        let half = it_dims * 0.5;
+        let at = |x: f32, y: f32, z: f32| it_pos + rot * Vec3::new(x, y, z);
         let ring = |y: f32| [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0)].map(|(sx, sz)| at(half.x * sx, y, half.z * sz));
         let strength = if it.solid { 1.0 } else { 0.6 };
         let whole = [(Vec3::ZERO, it.dims)];
         for &(off, dims) in if it.parts.is_empty() { &whole[..] } else { &it.parts[..] } {
+            let (off, dims) = (off * r, dims * r);
             let h = dims * 0.5;
-            let loop_at = |y: f32| [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0)].map(|(sx, sz)| it.pos + rot * (off + Vec3::new(h.x * sx, y, h.z * sz)));
+            let loop_at = |y: f32| [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0)].map(|(sx, sz)| it_pos + rot * (off + Vec3::new(h.x * sx, y, h.z * sz)));
             let (hi, lo) = (loop_at(h.y), loop_at(-h.y));
             for c in 0..4 {
                 for (a, b) in [(hi[c], hi[c + 1]), (lo[c], lo[c + 1]), (hi[c], lo[c])] {
-                    if aimed { edge(&mut accent, a, b, ACCENT, 1.0, eye, density * 0.4) } else { edge(&mut gizmos, a, b, air.ink, strength, eye, density) }
+                    if aimed {
+                        edge(&mut accent, a, b, ACCENT, 1.0, eye, density * 0.4)
+                    } else {
+                        edge(&mut gizmos, a, b, air.ink, strength, eye, density);
+                        if glow > 0.0 {
+                            edge(&mut accent, a, b, ACCENT, glow, eye, density * 0.4);
+                        }
+                    }
                 }
             }
         }
         // 中の区切りが、外から帯として見える
         for f in &it.bands {
-            let c = ring(half.y - f * it.dims.y);
+            let c = ring(half.y - f * it_dims.y);
             for pair in c.windows(2) {
                 edge(&mut gizmos, pair[0], pair[1], air.ink, 0.45, eye, density);
             }
         }
         if let Ok((mut node, mut vis, mut color)) = labels.get_mut(shown.labels[j]) {
             // 果てなく続く形は、名前が自分の近くについてくる
-            let ax = if it.dims.x > 200.0 { (eye.x - it.pos.x - 9.0).clamp(-half.x, half.x) } else { -half.x };
+            let ax = if it_dims.x > 200.0 { (eye.x - it_pos.x - 9.0).clamp(-half.x, half.x) } else { -half.x };
             let corner = at(ax, half.y, half.z);
             let near = corner.distance(eye) < w.radius * 0.8;
             match camera.world_to_viewport(&gt, corner) {
@@ -420,9 +651,9 @@ fn draw(
     }
     // 頼っている相手へ伸びる線: 柱の底から、相手の天辺へ
     for &(a, b, mine) in &w.links {
-        let (ia, ib) = (&w.items[a], &w.items[b]);
-        let from = ia.pos - Vec3::Y * ia.dims.y * 0.5;
-        let to = ib.pos + Vec3::Y * ib.dims.y * 0.5;
+        let ((pa, da), (pb, db)) = (eff(m, a, &w.items[a]), eff(m, b, &w.items[b]));
+        let from = pa - Vec3::Y * da.y * 0.5;
+        let to = pb + Vec3::Y * db.y * 0.5;
         edge(&mut gizmos, from, to, air.ink, if mine { 0.8 } else { 0.3 }, eye, density);
     }
 }
@@ -490,8 +721,14 @@ fn script(mut commands: Commands, time: Res<Time>, scape: Res<Scape>, mut nav: R
         }
     }
     let after = std::env::var("WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    // MORPH=<秒>: 形が動き始めてから、その秒数のところで撮る(動きの途中を確かめるため)
+    let mid: Option<f32> = std::env::var("MORPH").ok().and_then(|v| v.parse().ok());
+    let now = match mid {
+        Some(m) => nav.morph.as_ref().is_some_and(|x| x.t >= m),
+        None => t > ready + after,
+    };
     match *done {
-        None if t > ready + after => {
+        None if now => {
             commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
             *done = Some(t);
         }

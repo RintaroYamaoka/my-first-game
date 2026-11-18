@@ -11,10 +11,10 @@ RUN apk add --no-cache linux-virt
 FROM alpine:${ALPINE} AS rootfs
 # EXTRA: 追加で入れる部品(Rust モードを測るときは "rust cargo")
 ARG EXTRA=""
-RUN apk add --no-cache bash git nodejs vim nano less ${EXTRA}
+RUN apk add --no-cache bash git nodejs vim nano less inotify-tools ${EXTRA}
 COPY init /init
 COPY inittab /etc/inittab
-COPY boot.sh bench.sh bench2.sh bench3.sh runner.mjs /etc/game/
+COPY boot.sh agent.sh bench.sh bench2.sh bench3.sh runner.mjs /etc/game/
 COPY profile.sh /etc/profile.d/game.sh
 RUN chmod +x /init /etc/game/*.sh && rm -rf /var/cache/apk/*
 COPY sample /root/sample
