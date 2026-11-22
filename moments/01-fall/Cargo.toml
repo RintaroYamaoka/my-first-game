@@ -1,0 +1,16 @@
+[package]
+name = "fall"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bevy = { workspace = true }
+# 音(MIT OR Apache-2.0)。dbus を使う部分(Linux 用)は外す。読むのは FLAC だけ
+kira = { version = "=0.12.6", default-features = false, features = ["cpal", "flac"] }
+oxc_allocator = "0.159.0"
+oxc_ast = "0.159.0"
+oxc_ast_visit = "0.159.0"
+oxc_parser = "0.159.0"
+oxc_span = "0.159.0"
+serde_json = "1"

@@ -6,3 +6,6 @@ out/
 *.log
 .DS_Store
 target/
+
+# 曲や音の元のファイル(大きいので git に入れない。元は Suno と、本人の Windows の Music フォルダにある)
+assets-src/

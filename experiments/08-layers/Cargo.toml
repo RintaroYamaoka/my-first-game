@@ -1,0 +1,12 @@
+[package]
+name = "layers"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# 音は kira で鳴らすので、Bevy の音の機能は使わない(画面とキー入力だけ)
+bevy = { workspace = true }
+# ゲーム用の音の部品(MIT OR Apache-2.0)。パートをずれなく重ねる、拍に合わせる、こもらせる、を試す
+# 既定の機能のうち、実時間の優先度を dbus 経由で頼む部分(Linux 用。OS の部品 libdbus が要る)は外す。読むのは FLAC だけ
+kira = { version = "=0.12.6", default-features = false, features = ["cpal", "flac"] }

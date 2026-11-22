@@ -2,7 +2,7 @@
 # 実験を増やしても Bevy を作り直さずに済む
 [workspace]
 resolver = "3"
-members = ["experiments/01-world-from-code", "experiments/02-inside-code", "experiments/03-scape", "experiments/04-worlds", "experiments/05-terminal", "experiments/07-steam"]
+members = ["experiments/01-world-from-code", "experiments/02-inside-code", "experiments/03-scape", "experiments/04-worlds", "experiments/05-terminal", "experiments/07-steam", "experiments/08-layers", "moments/01-fall"]
 
 [workspace.dependencies]
 # 版は固定する(docs/decisions/0002)
